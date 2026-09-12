@@ -2,6 +2,7 @@
 # SUPERNALOTTO ENGINE V5 FINAL
 # ============================================================
 
+import os
 import re
 import math
 import time
@@ -173,9 +174,19 @@ def parse_month_page(year: int, month: int):
 
 def download_archive():
     print("\n" + "=" * 80)
-    print("DOWNLOAD ARCHIVIO UFFICIALE SUPERNALOTTO (1997-2026)")
+    print("VERIFICA ED INGESTION ARCHIVIO SUPERNALOTTO")
     print("=" * 80)
 
+    # 1. Se il CSV locale esiste, viene caricato evitando lo scraping
+    if os.path.exists(OUTPUT_CSV):
+        print(f"[+] Trovato archivio locale: {OUTPUT_CSV}. Caricamento in corso...")
+        df_local = pd.read_csv(OUTPUT_CSV)
+        if not df_local.empty:
+            print(f"[+] Caricate {len(df_local)} estrazioni dal file CSV locale.")
+            return df_local
+
+    # 2. Se non è presente il CSV locale, avvia lo scraping online
+    print("[!] Archivio locale non trovato. Avvio scraping da web...")
     all_records = []
     for year in range(FIRST_YEAR, LAST_YEAR + 1):
         for month in range(1, 13):
@@ -184,7 +195,7 @@ def download_archive():
             time.sleep(REQUEST_DELAY)
 
     if not all_records:
-        raise RuntimeError("Nessuna estrazione scaricata.")
+        raise RuntimeError("Nessuna estrazione scaricata dal web e nessun file CSV locale trovato.")
 
     return pd.DataFrame(all_records)
 
@@ -459,4 +470,3 @@ if __name__ == "__main__":
 
     except Exception as e:
         print(f"\n[!] ERRORE PIPELINE: {e}")
-        
