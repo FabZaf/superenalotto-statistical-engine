@@ -1,0 +1,48 @@
+name: SuperEnalotto V5 Execution & Data Sync
+
+on:
+  schedule:
+    # Esecuzione automatica ogni domenica alle 02:00 UTC
+    - cron: '0 2 * * 0'
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  run-engine:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configurazione Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Installazione dipendenze
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Esecuzione Engine V5 & Ingestion
+        run: |
+          python superenalotto_v5_final.py
+
+      - name: Commit e Push dei dati aggiornati
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          
+          git add superenalotto_storico.csv superenalotto_data_quality.csv v5_results_*.csv
+          
+          if git diff --staged --quiet; then
+            echo "Nessun aggiornamento nei dati o nei report."
+          else
+            git commit -m "chore(data): aggiornamento automatico storico e report V5 [skip ci]"
+            git push
+          fi
+          
