@@ -2,7 +2,6 @@ name: SuperEnalotto V5 Execution & Data Sync
 
 on:
   schedule:
-    # Esecuzione automatica ogni domenica alle 02:00 UTC
     - cron: '0 2 * * 0'
   workflow_dispatch:
   push:
@@ -21,7 +20,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
 
       - name: Installazione dipendenze
         run: |
@@ -32,17 +30,31 @@ jobs:
         run: |
           python superenalotto_v5_final.py
 
+      - name: Verifica file generati
+        run: |
+          echo "CSV presenti dopo l'esecuzione:"
+          find . -type f -name "*.csv" -print
+
       - name: Commit e Push dei dati aggiornati
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          
-          git add superenalotto_storico.csv superenalotto_data_quality.csv v5_results_*.csv
-          
+
+          CSV_FILES=$(find . -type f -name "*.csv" -print)
+
+          if [ -z "$CSV_FILES" ]; then
+            echo "Nessun file CSV generato. Nessun aggiornamento da effettuare."
+            exit 0
+          fi
+
+          echo "File CSV da aggiungere:"
+          echo "$CSV_FILES"
+
+          find . -type f -name "*.csv" -print0 | xargs -0 -r git add --
+
           if git diff --staged --quiet; then
             echo "Nessun aggiornamento nei dati o nei report."
           else
             git commit -m "chore(data): aggiornamento automatico storico e report V5 [skip ci]"
             git push
           fi
-          
