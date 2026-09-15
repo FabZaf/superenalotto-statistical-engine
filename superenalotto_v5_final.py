@@ -199,8 +199,6 @@ def parse_integer(value):
         return int(match.group(0))
     except Exception:
         return None
-return int(match.group(0))
-except Exception:
 return None
 
 def download_bootstrap():
