@@ -73,7 +73,7 @@ SESSION.headers.update({
 
 # ============================================================
 
-LOG & FAIL-CLOSED PREVENTIVO
+# LOG & FAIL-CLOSED PREVENTIVO
 
 # ============================================================
 
