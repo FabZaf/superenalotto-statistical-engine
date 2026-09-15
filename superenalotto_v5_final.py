@@ -306,32 +306,50 @@ if parsed_df.empty:
 return parsed_df
 
 def resolve_duplicates_strict(df):
-log("Verifica unicità della chiave (anno, concorso)...")
-initial_len = len(df)
+    log("Verifica unicità della chiave (anno, concorso)...")
 
-df_dedup = df.drop_duplicates(  
-    subset=["year", "concorso", "data", "n1", "n2", "n3", "n4", "n5", "n6"]  
-)  
-removed_exact = initial_len - len(df_dedup)  
-if removed_exact > 0:  
-    log(f"Rimosse {removed_exact} righe duplicate identiche.")  
+    initial_len = len(df)
 
-conflicts = df_dedup[df_dedup.duplicated(subset=["year", "concorso"], keep=False)]  
-if not conflicts.empty:  
-    log("ERRORE FATALE: Conflitto di estratti su medesimo anno e concorso:")  
-    log(conflicts[["year", "concorso", "data", "n1", "n2", "n3", "n4", "n5", "n6"]].to_string())  
-    return None, f"Conflitto dati irreconciliabile su {len(conflicts)} righe."  
+    df_dedup = df.drop_duplicates(
+        subset=[
+            "year", "concorso", "data",
+            "n1", "n2", "n3", "n4", "n5", "n6"
+        ]
+    )
 
-return df_dedup, None
+    removed_exact = initial_len - len(df_dedup)
 
-# ============================================================
+    if removed_exact > 0:
+        log(f"Rimosse {removed_exact} righe duplicate identiche.")
 
-SECUENTIALLY CONTROLLED AUDIT (FAIL-CLOSED)
+    conflicts = df_dedup[
+        df_dedup.duplicated(
+            subset=["year", "concorso"],
+            keep=False
+        )
+    ]
 
-# ============================================================
+    if not conflicts.empty:
+        log(
+            "ERRORE FATALE: Conflitto di estratti "
+            "su medesimo anno e concorso:"
+        )
 
-def run_strict_data_audit():
-log("=======================================================")
+        log(
+            conflicts[
+                [
+                    "year", "concorso", "data",
+                    "n1", "n2", "n3", "n4", "n5", "n6"
+                ]
+            ].to_string()
+        )
+
+        return None, (
+            f"Conflitto dati irreconciliabile "
+            f"su {len(conflicts)} righe."
+        )
+
+    return df_dedup, None
 log("   SUPERNALOTTO PIPELINE V5.2.5 - STRICT DATA AUDIT")
 log("=======================================================")
 
