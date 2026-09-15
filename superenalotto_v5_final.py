@@ -99,46 +99,63 @@ def remove_stale_dataset():
             )
 
 def write_report(status, total_records, errors, warnings, df=None):
-report = {
-"timestamp": datetime.now().isoformat(),
-"status": status,
-"total_records": int(total_records),
-"required_start_year": REQUIRED_START_YEAR,
-"current_year": CURRENT_YEAR,
-"windows": {
-"training": [TRAINING_START_YEAR, TRAINING_END_YEAR],
-"discovery": [DISCOVERY_START_YEAR, DISCOVERY_END_YEAR],
-"confirmation": [CONFIRMATION_START_YEAR, CURRENT_YEAR]
-},
-"errors": list(errors),
-"warnings": list(warnings),
-}
+    report = {
+        "timestamp": datetime.now().isoformat(),
+        "status": status,
+        "total_records": int(total_records),
+        "required_start_year": REQUIRED_START_YEAR,
+        "current_year": CURRENT_YEAR,
+        "windows": {
+            "training": [TRAINING_START_YEAR, TRAINING_END_YEAR],
+            "discovery": [DISCOVERY_START_YEAR, DISCOVERY_END_YEAR],
+            "confirmation": [CONFIRMATION_START_YEAR, CURRENT_YEAR]
+        },
+        "errors": list(errors),
+        "warnings": list(warnings),
+    }
 
-if df is not None and not df.empty:  
-    report["date_range"] = {  
-        "min": str(df["data"].min()),  
-        "max": str(df["data"].max())  
-    }  
-    report["contest_range"] = {  
-        "min": int(df["concorso"].min()),  
-        "max": int(df["concorso"].max())  
-    }  
+    if df is not None and not df.empty:
+        report["date_range"] = {
+            "min": str(df["data"].min()),
+            "max": str(df["data"].max())
+        }
 
-    yearly_counts = df.groupby("year").size().astype(int).to_dict()  
-    report["yearly_counts"] = {str(k): int(v) for k, v in yearly_counts.items()}  
+        report["contest_range"] = {
+            "min": int(df["concorso"].min()),
+            "max": int(df["concorso"].max())
+        }
 
-    report["window_counts"] = {  
-        "training_1997_2015": int(  
-            ((df["year"] >= TRAINING_START_YEAR) & (df["year"] <= TRAINING_END_YEAR)).sum()  
-        ),  
-        "discovery_2016_2021": int(  
-            ((df["year"] >= DISCOVERY_START_YEAR) & (df["year"] <= DISCOVERY_END_YEAR)).sum()  
-        ),  
-        "confirmation_2022_current": int(  
-            ((df["year"] >= CONFIRMATION_START_YEAR) & (df["year"] <= CURRENT_YEAR)).sum()  
-        )  
-    }  
+        yearly_counts = df.groupby("year").size().astype(int).to_dict()
+        report["yearly_counts"] = {
+            str(k): int(v) for k, v in yearly_counts.items()
+        }
 
+        report["window_counts"] = {
+            "training_1997_2015": int(
+                ((df["year"] >= TRAINING_START_YEAR) &
+                 (df["year"] <= TRAINING_END_YEAR)).sum()
+            ),
+            "discovery_2016_2021": int(
+                ((df["year"] >= DISCOVERY_START_YEAR) &
+                 (df["year"] <= DISCOVERY_END_YEAR)).sum()
+            ),
+            "confirmation_2022_current": int(
+                ((df["year"] >= CONFIRMATION_START_YEAR) &
+                 (df["year"] <= CURRENT_YEAR)).sum()
+            )
+        }
+
+    try:
+        with open(AUDIT_REPORT, "w", encoding="utf-8") as handle:
+            json.dump(report, handle, indent=2, ensure_ascii=False)
+
+        log(f"Report di integrità generato in '{AUDIT_REPORT}'.")
+
+    except Exception as exc:
+        log(
+            f"ERRORE CRITICO nella scrittura del report "
+            f"'{AUDIT_REPORT}': {exc}"
+        )
 try:  
     with open(AUDIT_REPORT, "w", encoding="utf-8") as handle:  
         json.dump(report, handle, indent=2, ensure_ascii=False)  
