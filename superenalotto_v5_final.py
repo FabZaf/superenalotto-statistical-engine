@@ -173,11 +173,12 @@ def clean_col(name):
     return str(name).strip().lower()
 
 def find_column(columns, patterns):
-for col in columns:
-name = clean_col(col)
-for pattern in patterns:
-if re.search(pattern, name):
-return col
+    for col in columns:
+        name = clean_col(col)
+        for pattern in patterns:
+            if re.search(pattern, name):
+                return col
+    return None
 return None
 
 def parse_integer(value):
