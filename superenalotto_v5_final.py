@@ -202,35 +202,42 @@ def parse_integer(value):
 return None
 
 def download_bootstrap():
-log("=======================================================")
-log("DOWNLOAD ARCHIVIO BOOTSTRAP")
-log("=======================================================")
-log(f"Fonte: {BOOTSTRAP_URL}")
+    log("=======================================================")
+    log("DOWNLOAD ARCHIVIO BOOTSTRAP")
+    log("=======================================================")
+    log(f"Fonte: {BOOTSTRAP_URL}")
 
-last_error = None  
-for attempt in range(1, HTTP_RETRIES + 1):  
-    try:  
-        log(f"Tentativo {attempt}/{HTTP_RETRIES}...")  
-        response = SESSION.get(BOOTSTRAP_URL, timeout=HTTP_TIMEOUT)  
-        response.raise_for_status()  
+    last_error = None
 
-        text = response.text.strip()  
-        if not text:  
-            raise ValueError("Risposta vuota dal server HTTP.")  
+    for attempt in range(1, HTTP_RETRIES + 1):
+        try:
+            log(f"Tentativo {attempt}/{HTTP_RETRIES}...")
 
-        log(f"Download completato ({len(text)} caratteri).")  
-        return text  
-    except Exception as exc:  
-        last_error = exc  
-        log(f"Fallito tentativo {attempt}: {exc}")  
-        if attempt < HTTP_RETRIES:  
-            time.sleep(HTTP_RETRY_SLEEP)  
+            response = SESSION.get(
+                BOOTSTRAP_URL,
+                timeout=HTTP_TIMEOUT
+            )
+            response.raise_for_status()
 
-raise RuntimeError(  
-    f"Impossibile scaricare il bootstrap dopo {HTTP_RETRIES} tentativi: {last_error}"  
-)
+            text = response.text.strip()
 
-def parse_csv_data(csv_text):
+            if not text:
+                raise ValueError("Risposta vuota dal server HTTP.")
+
+            log(f"Download completato ({len(text)} caratteri).")
+            return text
+
+        except Exception as exc:
+            last_error = exc
+            log(f"Fallito tentativo {attempt}: {exc}")
+
+            if attempt < HTTP_RETRIES:
+                time.sleep(HTTP_RETRY_SLEEP)
+
+    raise RuntimeError(
+        f"Impossibile scaricare il bootstrap dopo "
+        f"{HTTP_RETRIES} tentativi: {last_error}"
+    )
 log("Parsing e normalizzazione CSV...")
 
 sample = csv_text[:4096]  
