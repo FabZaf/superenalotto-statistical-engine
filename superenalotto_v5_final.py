@@ -170,7 +170,7 @@ PARSING & UTILITIES
 # ============================================================
 
 def clean_col(name):
-return str(name).strip().lower()
+    return str(name).strip().lower()
 
 def find_column(columns, patterns):
 for col in columns:
