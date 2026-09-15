@@ -179,7 +179,6 @@ def find_column(columns, patterns):
             if re.search(pattern, name):
                 return col
     return None
-return None
 
 def parse_integer(value):
     if value is None:
