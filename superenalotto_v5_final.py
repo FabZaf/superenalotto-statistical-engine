@@ -182,7 +182,6 @@ def find_column(columns, patterns):
 
 def parse_integer(value):
     def parse_integer(value):
-    def parse_integer(value):
     if value is None:
         return None
 
@@ -199,6 +198,7 @@ def parse_integer(value):
     try:
         return int(match.group(0))
     except Exception:
+        return None
         return None
 def download_bootstrap():
     log("=======================================================")
