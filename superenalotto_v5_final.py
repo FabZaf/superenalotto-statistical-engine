@@ -84,19 +84,19 @@ def log(message):
         flush=True
     )
 def remove_stale_dataset():
-"""
-Fail-Closed Rigido: Se il dataset precedente esiste e non può essere eliminato,
-l'esecuzione DEVE bloccarsi immediatamente.
-"""
-if os.path.exists(OUTPUT_CSV):
-try:
-os.remove(OUTPUT_CSV)
-log(f"Dataset precedente '{OUTPUT_CSV}' eliminato con successo.")
-except Exception as exc:
-raise RuntimeError(
-f"FAIL-CLOSED FATALE: Impossibile eliminare il dataset precedente "
-f"'{OUTPUT_CSV}': {exc}"
-)
+    """
+    Fail-Closed Rigido: Se il dataset precedente esiste e non può essere eliminato,
+    l'esecuzione DEVE bloccarsi immediatamente.
+    """
+    if os.path.exists(OUTPUT_CSV):
+        try:
+            os.remove(OUTPUT_CSV)
+            log(f"Dataset precedente '{OUTPUT_CSV}' eliminato con successo.")
+        except Exception as exc:
+            raise RuntimeError(
+                f"FAIL-CLOSED FATALE: Impossibile eliminare il dataset precedente "
+                f"'{OUTPUT_CSV}': {exc}"
+            )
 
 def write_report(status, total_records, errors, warnings, df=None):
 report = {
