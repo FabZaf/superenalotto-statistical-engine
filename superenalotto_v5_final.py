@@ -181,6 +181,7 @@ def find_column(columns, patterns):
     return None
 
 def parse_integer(value):
+    def parse_integer(value):
     if value is None:
         return None
 
@@ -198,8 +199,6 @@ def parse_integer(value):
         return int(match.group(0))
     except Exception:
         return None
-return None
-
 def download_bootstrap():
     log("=======================================================")
     log("DOWNLOAD ARCHIVIO BOOTSTRAP")
