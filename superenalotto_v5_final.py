@@ -182,15 +182,23 @@ def find_column(columns, patterns):
 return None
 
 def parse_integer(value):
-if value is None:
-return None
-text = str(value).strip()
-if not text or text.lower() == "nan":
-return None
-match = re.search(r"\d+", text)
-if not match:
-return None
-try:
+    if value is None:
+        return None
+
+    text = str(value).strip()
+
+    if not text or text.lower() == "nan":
+        return None
+
+    match = re.search(r"\d+", text)
+
+    if not match:
+        return None
+
+    try:
+        return int(match.group(0))
+    except Exception:
+        return None
 return int(match.group(0))
 except Exception:
 return None
