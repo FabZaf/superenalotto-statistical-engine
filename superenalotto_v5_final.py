@@ -77,12 +77,12 @@ SESSION.headers.update({
 
 # ============================================================
 
+de
 def log(message):
-print(
-f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}",
-flush=True
-)
-
+    print(
+        f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}",
+        flush=True
+    )
 def remove_stale_dataset():
 """
 Fail-Closed Rigido: Se il dataset precedente esiste e non può essere eliminato,
