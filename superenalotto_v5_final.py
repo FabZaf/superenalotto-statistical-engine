@@ -472,5 +472,5 @@ log("=======================================================")
 if status == "FAILED":  
     sys.exit(1)
 
-if name == "main":
-run_strict_data_audit()
+if __name__ == "__main__":
+    run_strict_data_audit()
