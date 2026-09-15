@@ -182,6 +182,7 @@ def find_column(columns, patterns):
 
 def parse_integer(value):
     def parse_integer(value):
+    def parse_integer(value):
     if value is None:
         return None
 
