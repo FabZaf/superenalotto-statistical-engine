@@ -1,44 +1,13 @@
-============================================================
-
-SUPERNALOTTO PIPELINE V5.2.5 (DEFINITIVA - AUDIT RIGIDO)
-
-STRICT DATA INTEGRITY AUDIT — ENGINE DISABLED
-
-
-
-SCOPO:
-
-1. Rimuovere preventivamente vecchi dataset (Fail-Closed).
-
-2. Scaricare l'archivio storico dal bootstrap.
-
-3. Normalizzare e validare l'integrità delle sestine.
-
-4. Verificare l'assenza di duplicati o conflitti su (anno, concorso).
-
-5. Verificare la presenza COMPLETA e CONTINUA di tutte le finestre:
-
-- Training      : 1997-2015 (tutti gli anni obbligatori)
-
-- Discovery     : 2016-2021 (tutti gli anni obbligatori)
-
-- Confirmation  : 2022-2026 (tutti gli anni obbligatori fino all'anno corrente)
-
-6. Verificare che l'anno massimo nel dataset sia EFFETTIVAMENTE il 2026.
-
-7. Generare:
-
-- superenalotto_storico.csv (SOLO se VERIFIED_VALID o VALID_WITH_WARNINGS)
-
-- integrity_report.json (sempre, per tracciamento audit)
-
-
-
-ENGINE:
-
-COMPLETAMENTE DISABILITATO.
-
-============================================================
+# ============================================================
+# SUPERNALOTTO PIPELINE V5.2.5 (DEFINITIVA - AUDIT RIGIDO)
+# STRICT DATA INTEGRITY AUDIT — ENGINE DISABLED
+#
+# SCOPO:
+#   Audit rigoroso dell'archivio storico SuperEnalotto.
+#
+# ENGINE:
+#   COMPLETAMENTE DISABILITATO.
+# ============================================================
 
 import os
 import re
