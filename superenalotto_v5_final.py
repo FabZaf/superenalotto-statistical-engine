@@ -1,695 +1,1108 @@
-# ============================================================
-# SUPERNALOTTO PIPELINE V5.2.6 — STRICT DATA INTEGRITY AUDIT
-# ENGINE DISABLED
-#
-# Scopo:
-#   1) scaricare l'archivio storico CSV
-#   2) normalizzarlo in modo difensivo
-#   3) verificare integrità, numeri, date e duplicati
-#   4) verificare copertura 1997 -> anno corrente
-#   5) esportare il CSV SOLO se l'audit passa
-#
-# Nessuna previsione, nessuna strategia e nessuna generazione
-# di numeri viene eseguita in questa versione.
-# ============================================================
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+SUPERNALOTTO PIPELINE V5.3
+==========================
+
+OBIETTIVO
+---------
+Costruzione e audit rigoroso dello storico SuperEnalotto.
+
+IMPORTANTE:
+Questo programma NON esegue previsioni e NON genera combinazioni da giocare.
+
+Il motore statistico resta DISABILITATO fino a quando l'integrità
+dello storico non è dimostrata.
+
+FONTE
+-----
+Archivio annuale:
+https://www.estrazioni.it/superenalotto/?anno=YYYY
+
+PRINCIPI
+--------
+1. L'anno viene dalla URL annuale.
+2. Il conteggio ufficialmente dichiarato nella pagina viene verificato.
+3. Ogni estrazione deve avere:
+   - anno
+   - concorso
+   - data
+   - 6 numeri principali distinti
+4. Jolly e SuperStar NON entrano nei 6 numeri principali.
+5. La numerazione del concorso è annuale:
+   chiave univoca = (anno, concorso)
+6. Nessuna interpolazione.
+7. Nessun riempimento automatico.
+8. Nessun dato ambiguo viene accettato.
+9. Se un anno fallisce, l'intera pipeline fallisce.
+"""
+
+from __future__ import annotations
 
 import json
-import os
 import re
+import sys
 import time
+import unicodedata
 from datetime import datetime
-from io import StringIO
 from html.parser import HTMLParser
+from pathlib import Path
 
 import pandas as pd
 import requests
 
 
-# ============================================================
-# CONFIGURAZIONE RIGIDA
-# ============================================================
+# ============================================================================
+# CONFIGURAZIONE
+# ============================================================================
 
-REQUIRED_START_YEAR = 1997
+PIPELINE_VERSION = "V5.3"
 
-TRAINING_START_YEAR = 1997
-TRAINING_END_YEAR = 2015
+SOURCE_BASE = "https://www.estrazioni.it/superenalotto/?anno={year}"
 
-DISCOVERY_START_YEAR = 2016
-DISCOVERY_END_YEAR = 2021
+START_YEAR = 1997
+END_YEAR = datetime.now().year
 
-CONFIRMATION_START_YEAR = 2022
-CURRENT_YEAR = datetime.now().year
+OUTPUT_CSV = "superenalotto_history.csv"
+REPORT_JSON = "integrity_report.json"
 
-OUTPUT_CSV = "superenalotto_storico.csv"
-AUDIT_REPORT = "integrity_report.json"
+REQUEST_TIMEOUT = 30
+RETRIES = 3
+RETRY_SLEEP = 2.0
 
-BOOTSTRAP_URL = (
-    "https://www.estrazioni.it/"
-    "index.php?formato=csv&p=download&tipo=superenalotto"
-)
+# Il motore statistico resta esplicitamente disabilitato.
+ENGINE_ENABLED = False
 
-HTTP_TIMEOUT = 30
-HTTP_RETRIES = 3
-HTTP_RETRY_SLEEP = 3
-
-MIN_HISTORICAL_DRAWS_PER_YEAR = 80
-MIN_TOTAL_RECORDS = 1000
-
-VALID_NUMBERS_MIN = 1
-VALID_NUMBERS_MAX = 90
-NUMBERS_PER_DRAW = 6
+# Sei numeri principali su 90.
+MAIN_NUMBERS = 6
+MIN_NUMBER = 1
+MAX_NUMBER = 90
 
 
-# ============================================================
-# SESSIONE HTTP
-# ============================================================
-
-SESSION = requests.Session()
-SESSION.headers.update(
-    {
-        "User-Agent": (
-            "Mozilla/5.0 (compatible; "
-            "SuperEnalotto-Statistical-Audit/5.2.6)"
-        )
-    }
-)
-
-
-# ============================================================
+# ============================================================================
 # LOG
-# ============================================================
+# ============================================================================
 
-def log(message):
-    print(
-        f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
-        f"{message}",
-        flush=True,
-    )
+def log(message: str) -> None:
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{stamp}] {message}", flush=True)
 
 
-# ============================================================
-# FAIL-CLOSED
-# ============================================================
+# ============================================================================
+# NORMALIZZAZIONE TESTO
+# ============================================================================
 
-def remove_stale_dataset():
+def normalize_unicode(text: str) -> str:
     """
-    Elimina il dataset precedente prima dell'audit.
-    Se non è possibile eliminarlo, l'esecuzione viene bloccata.
+    Normalizza varianti Unicode che possono comparire nell'HTML:
+    ° º № ecc.
+
+    Non modifica i numeri.
     """
-    if os.path.exists(OUTPUT_CSV):
-        try:
-            os.remove(OUTPUT_CSV)
-            log(
-                f"Dataset precedente '{OUTPUT_CSV}' "
-                "eliminato con successo."
-            )
-        except Exception as exc:
-            raise RuntimeError(
-                "FAIL-CLOSED FATALE: impossibile eliminare il "
-                f"dataset precedente '{OUTPUT_CSV}': {exc}"
-            )
+    text = unicodedata.normalize("NFKC", text)
 
-
-# ============================================================
-# REPORT
-# ============================================================
-
-def write_report(status, total_records, errors, warnings, df=None):
-    report = {
-        "timestamp": datetime.now().isoformat(),
-        "status": status,
-        "total_records": int(total_records),
-        "required_start_year": REQUIRED_START_YEAR,
-        "current_year": CURRENT_YEAR,
-        "windows": {
-            "training": [
-                TRAINING_START_YEAR,
-                TRAINING_END_YEAR,
-            ],
-            "discovery": [
-                DISCOVERY_START_YEAR,
-                DISCOVERY_END_YEAR,
-            ],
-            "confirmation": [
-                CONFIRMATION_START_YEAR,
-                CURRENT_YEAR,
-            ],
-        },
-        "errors": list(errors),
-        "warnings": list(warnings),
+    replacements = {
+        "\xa0": " ",
+        "№": "n.",
+        "º": ".",
+        "°": ".",
+        "ª": ".",
+        "\u200b": "",
+        "\u200c": "",
+        "\u200d": "",
+        "\ufeff": "",
     }
 
-    if df is not None and not df.empty:
-        report["date_range"] = {
-            "min": str(df["data"].min()),
-            "max": str(df["data"].max()),
-        }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
 
-        report["contest_range"] = {
-            "min": int(df["concorso"].min()),
-            "max": int(df["concorso"].max()),
-        }
-
-        yearly_counts = (
-            df.groupby("year")
-            .size()
-            .astype(int)
-            .to_dict()
-        )
-
-        report["yearly_counts"] = {
-            str(k): int(v)
-            for k, v in yearly_counts.items()
-        }
-
-        report["window_counts"] = {
-            "training_1997_2015": int(
-                (
-                    (df["year"] >= TRAINING_START_YEAR)
-                    & (df["year"] <= TRAINING_END_YEAR)
-                ).sum()
-            ),
-            "discovery_2016_2021": int(
-                (
-                    (df["year"] >= DISCOVERY_START_YEAR)
-                    & (df["year"] <= DISCOVERY_END_YEAR)
-                ).sum()
-            ),
-            "confirmation_2022_current": int(
-                (
-                    (df["year"] >= CONFIRMATION_START_YEAR)
-                    & (df["year"] <= CURRENT_YEAR)
-                ).sum()
-            ),
-        }
-
-    try:
-        with open(
-            AUDIT_REPORT,
-            "w",
-            encoding="utf-8",
-        ) as handle:
-            json.dump(
-                report,
-                handle,
-                indent=2,
-                ensure_ascii=False,
-            )
-
-        log(
-            f"Report di integrità generato in "
-            f"'{AUDIT_REPORT}'."
-        )
-
-    except Exception as exc:
-        log(
-            "ERRORE CRITICO nella scrittura del report "
-            f"'{AUDIT_REPORT}': {exc}"
-        )
+    return text
 
 
-# ============================================================
-# UTILITY PARSING
-# ============================================================
-
-def clean_col(name):
-    return str(name).strip().lower()
+def normalize_space(text: str) -> str:
+    text = normalize_unicode(text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
 
 
-def normalize_col_name(name):
-    text = clean_col(name)
-    text = (
-        text.replace("à", "a")
-        .replace("è", "e")
-        .replace("é", "e")
-        .replace("ì", "i")
-        .replace("ò", "o")
-        .replace("ù", "u")
-    )
-    return re.sub(r"[^a-z0-9]+", "", text)
-
-
-def find_column(columns, patterns):
-    for col in columns:
-        name = clean_col(col)
-        normalized = normalize_col_name(col)
-
-        for pattern in patterns:
-            if re.search(pattern, name):
-                return col
-
-            if re.search(pattern, normalized):
-                return col
-
-    return None
-
-
-def parse_integer(value):
-    if value is None:
-        return None
-
-    if pd.isna(value):
-        return None
-
-    text = str(value).strip()
-
-    if not text or text.lower() in {"nan", "none", "null"}:
-        return None
-
-    match = re.search(r"(?<!\d)(\d{1,3})(?!\d)", text)
-
-    if not match:
-        return None
-
-    try:
-        return int(match.group(1))
-    except Exception:
-        return None
-
-
-def parse_date_value(value):
-    if value is None or pd.isna(value):
-        return pd.NaT
-
-    text = str(value).strip()
-
-    if not text or text.lower() in {"nan", "none", "null"}:
-        return pd.NaT
-
-    # Primo tentativo: parser Pandas.
-    parsed = pd.to_datetime(
-        text,
-        errors="coerce",
-        dayfirst=True,
-    )
-
-    if not pd.isna(parsed):
-        return parsed.normalize()
-
-    # Secondo tentativo: date italiane esplicite.
-    match = re.search(
-        r"(\d{1,2})[./-](\d{1,2})[./-](\d{4})",
-        text,
-    )
-
-    if match:
-        day = int(match.group(1))
-        month = int(match.group(2))
-        year = int(match.group(3))
-
-        try:
-            return pd.Timestamp(
-                year=year,
-                month=month,
-                day=day,
-            )
-        except Exception:
-            return pd.NaT
-
-    return pd.NaT
-
-
-def parse_contest_value(value):
-    if value is None or pd.isna(value):
-        return None
-
-    text = str(value).strip()
-
-    # Gestisce "Concorso Nº 123", "123", ecc.
-    match = re.search(r"(\d+)", text)
-
-    if not match:
-        return None
-
-    try:
-        return int(match.group(1))
-    except Exception:
-        return None
-
-
-# ============================================================
-# ANNUAL ARCHIVE ACQUISITION
-# ============================================================
-
-OFFICIAL_ARCHIVE_BASE = "https://www.estrazioni.it/superenalotto/?anno={year}"
-
+# ============================================================================
+# HTML -> TESTO
+# ============================================================================
 
 class VisibleTextParser(HTMLParser):
-    """Dependency-free HTML visible-text extractor."""
-    def __init__(self):
-        super().__init__()
-        self.parts = []
+    """
+    Estrae esclusivamente testo visibile.
+
+    Non cerca numeri nell'intero HTML grezzo, perché menu, URL,
+    attributi HTML e script possono contenere numeri irrilevanti.
+    """
+
+    SKIP_TAGS = {
+        "script",
+        "style",
+        "noscript",
+        "svg",
+        "template",
+    }
+
+    BLOCK_TAGS = {
+        "br",
+        "p",
+        "div",
+        "li",
+        "tr",
+        "section",
+        "article",
+        "header",
+        "footer",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+    }
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self.skip_depth = 0
+
+    def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
+
+        if tag in self.SKIP_TAGS:
+            self.skip_depth += 1
+            return
+
+        if tag in self.BLOCK_TAGS:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+
+        if tag in self.SKIP_TAGS:
+            if self.skip_depth > 0:
+                self.skip_depth -= 1
+            return
+
+        if tag in self.BLOCK_TAGS:
+            self.parts.append("\n")
 
     def handle_data(self, data):
-        text = " ".join(data.split())
-        if text:
-            self.parts.append(text)
+        if self.skip_depth == 0 and data:
+            self.parts.append(data)
+
+    def text(self) -> str:
+        raw = "".join(self.parts)
+        raw = normalize_unicode(raw)
+
+        # Manteniamo i ritorni a capo perché sono utili per diagnosticare
+        # la struttura della pagina.
+        raw = re.sub(r"[ \t\r\f\v]+", " ", raw)
+        raw = re.sub(r"\n[ \t]+", "\n", raw)
+        raw = re.sub(r"[ \t]+\n", "\n", raw)
+
+        return raw.strip()
 
 
-def html_to_text_lines(html):
+def html_to_visible_text(html: str) -> str:
     parser = VisibleTextParser()
     parser.feed(html)
     parser.close()
-    return parser.parts
+    return parser.text()
 
 
-def fetch_year_page(year):
-    url = OFFICIAL_ARCHIVE_BASE.format(year=year)
+# ============================================================================
+# HTTP
+# ============================================================================
+
+SESSION = requests.Session()
+
+SESSION.headers.update({
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) "
+        "AppleWebKit/537.36 "
+        "(KHTML, like Gecko) "
+        "Chrome/131.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml",
+    "Accept-Language": "it-IT,it;q=0.9,en;q=0.8",
+})
+
+
+def fetch_year_page(year: int) -> str:
+    url = SOURCE_BASE.format(year=year)
+
     last_error = None
 
-    for attempt in range(1, HTTP_RETRIES + 1):
+    for attempt in range(1, RETRIES + 1):
+        log(f"WEB FETCH {year} (tentativo {attempt}/{RETRIES})")
+
         try:
-            log(f"WEB FETCH {year} (tentativo {attempt}/{HTTP_RETRIES})")
-            response = SESSION.get(url, timeout=HTTP_TIMEOUT)
+            response = SESSION.get(
+                url,
+                timeout=REQUEST_TIMEOUT,
+            )
+
             response.raise_for_status()
-            if not response.content:
-                raise RuntimeError("Risposta HTTP vuota.")
-            response.encoding = response.apparent_encoding or "utf-8"
-            html = response.text
-            if len(html.strip()) < 1000:
-                raise RuntimeError("Pagina HTML anormalmente corta.")
-            return html
+
+            if not response.text or len(response.text) < 1000:
+                raise RuntimeError(
+                    f"risposta HTML troppo corta ({len(response.text)} byte)"
+                )
+
+            return response.text
+
         except Exception as exc:
             last_error = exc
-            log(f"FETCH {year} fallito: {exc}")
-            if attempt < HTTP_RETRIES:
-                time.sleep(HTTP_RETRY_SLEEP)
+            log(f"WARNING: fetch {year} fallito: {exc}")
 
-    raise RuntimeError(f"Impossibile recuperare l'archivio {year}: {last_error}")
+            if attempt < RETRIES:
+                time.sleep(RETRY_SLEEP)
 
-
-CONTEST_RE = re.compile(r"Concorso\s*(?:n\.?|N\.?|№)\s*(\d+)", re.IGNORECASE)
-DATE_RE = re.compile(r"\b(\d{1,2}/\d{1,2}/\d{4})\b")
-NUMBER_RE = re.compile(r"(?<!\d)(\d{1,2})(?!\d)")
+    raise RuntimeError(
+        f"Impossibile scaricare l'anno {year}: {last_error}"
+    )
 
 
-def parse_annual_page(html, year):
+# ============================================================================
+# REGEX
+# ============================================================================
+
+DATE_RE = re.compile(
+    r"\b(\d{1,2}/\d{1,2}/\d{4})\b"
+)
+
+DECLARED_COUNT_RE_TEMPLATE = (
+    r"\b(\d+)\s+estrazioni\s+nel\s+{year}\b"
+)
+
+# Formati possibili:
+#
+# Concorso n. 157 31/12/2013
+# Concorso n 157 31/12/2013
+# Concorso N. 157 31/12/2013
+# Concorso № 157 31/12/2013
+#
+CONTEST_DATE_RE = re.compile(
+    r"""
+    Concorso
+    \s*
+    (?:n|N)
+    \s*
+    [.:]?
+    \s*
+    (\d+)
+    \s+
+    (\d{1,2}/\d{1,2}/\d{4})
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+# Formato moderno osservato nell'archivio:
+#
+# SuperEnalotto 31/12/2016
+#
+MODERN_DRAW_RE = re.compile(
+    r"""
+    SuperEnalotto
+    \s+
+    (\d{1,2}/\d{1,2}/\d{4})
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+NUMBER_RE = re.compile(
+    r"(?<!\d)(\d{1,2})(?!\d)"
+)
+
+
+# ============================================================================
+# CONTEGGIO DICHIARATO DALLA PAGINA
+# ============================================================================
+
+def extract_declared_count(text: str, year: int) -> int:
+    pattern = re.compile(
+        DECLARED_COUNT_RE_TEMPLATE.format(year=year),
+        re.IGNORECASE,
+    )
+
+    match = pattern.search(normalize_space(text))
+
+    if not match:
+        raise RuntimeError(
+            f"Anno {year}: impossibile trovare il conteggio "
+            f"'X estrazioni nel {year}'."
+        )
+
+    return int(match.group(1))
+
+
+# ============================================================================
+# PARSING DI UNA SINGOLA ESTRAZIONE
+# ============================================================================
+
+def validate_numbers(
+    numbers: list[int],
+    year: int,
+    contest: int,
+    date_text: str,
+) -> tuple[int, ...]:
+    if len(numbers) != MAIN_NUMBERS:
+        raise ValueError(
+            f"Anno {year}, concorso {contest}: "
+            f"attesi {MAIN_NUMBERS} numeri principali, "
+            f"trovati {len(numbers)}."
+        )
+
+    if any(
+        n < MIN_NUMBER or n > MAX_NUMBER
+        for n in numbers
+    ):
+        raise ValueError(
+            f"Anno {year}, concorso {contest}: "
+            f"numero fuori intervallo 1-90: {numbers}"
+        )
+
+    if len(set(numbers)) != MAIN_NUMBERS:
+        raise ValueError(
+            f"Anno {year}, concorso {contest}: "
+            f"numeri principali duplicati: {numbers}"
+        )
+
+    try:
+        dt = datetime.strptime(date_text, "%d/%m/%Y")
+    except ValueError as exc:
+        raise ValueError(
+            f"Anno {year}, concorso {contest}: "
+            f"data non valida {date_text}"
+        ) from exc
+
+    if dt.year != year:
+        raise ValueError(
+            f"Anno {year}, concorso {contest}: "
+            f"data {date_text} non appartiene all'anno {year}."
+        )
+
+    return tuple(numbers)
+
+
+def extract_first_six_main_numbers(text: str) -> tuple[int, ...]:
     """
-    Parse one explicit annual SuperEnalotto archive page.
+    ESTREMAMENTE IMPORTANTE.
 
-    The archive page exposes each draw as a block beginning with
-    "Concorso n. <N> <date>" followed immediately by the six main
-    numbers and then Jolly.  We deliberately take ONLY the first six
-    numeric tokens after the date.  We do not scrape every number in
-    the block, because Jolly, SuperStar and page metadata are separate
-    fields and must never enter n1..n6.
+    La pagina presenta:
+
+        6 numeri principali
+        Jolly
+        SuperStar
+
+    Il numero del Jolly può apparire PRIMA della parola 'Jolly':
+
+        34 36 71 76 86 89
+        82 Jolly
+
+    Quindi NON dobbiamo fare:
+
+        "prendi tutti i numeri prima di Jolly"
+
+    perché otterremmo 7 numeri.
+
+    Prendiamo invece i primi sei numeri validi del corpo
+    dell'estrazione.
+
+    La delimitazione del record è già stata fatta dal parser.
     """
-    lines = html_to_text_lines(html)
-    if not lines:
-        raise RuntimeError(f"Anno {year}: nessun testo visibile estratto.")
 
-    positions = []
-    for idx, line in enumerate(lines):
-        m = CONTEST_RE.search(line)
-        if m:
-            positions.append((idx, int(m.group(1))))
+    # Se nel corpo è presente "Jolly", manteniamo comunque il corpo:
+    # il primo numero del Jolly viene dopo i sei principali.
+    #
+    # NON tagliamo al termine "Jolly", perché il numero Jolly può
+    # precederlo nel testo.
+    #
+    # Ci interessa esclusivamente la prima sequenza valida di 6 numeri.
 
-    if not positions:
-        raise RuntimeError(f"Anno {year}: nessun 'Concorso n.' riconosciuto.")
+    tokens = NUMBER_RE.findall(text)
+
+    values = [int(x) for x in tokens]
+
+    # Cerchiamo la prima sequenza di 6 numeri distinti e compresi 1-90.
+    for i in range(0, len(values) - MAIN_NUMBERS + 1):
+        candidate = values[i:i + MAIN_NUMBERS]
+
+        if len(candidate) != MAIN_NUMBERS:
+            continue
+
+        if not all(
+            MIN_NUMBER <= n <= MAX_NUMBER
+            for n in candidate
+        ):
+            continue
+
+        if len(set(candidate)) != MAIN_NUMBERS:
+            continue
+
+        return tuple(candidate)
+
+    raise ValueError(
+        "Impossibile identificare una sequenza valida "
+        "di 6 numeri principali."
+    )
+
+
+# ============================================================================
+# PARSER ANNUALE
+# ============================================================================
+
+def parse_annual_page(
+    html: str,
+    year: int,
+) -> tuple[pd.DataFrame, dict]:
+    """
+    Parser annuale fail-closed.
+
+    Restituisce:
+        DataFrame
+        metadata di audit
+    """
+
+    visible = html_to_visible_text(html)
+
+    if not visible:
+        raise RuntimeError(
+            f"Anno {year}: nessun testo visibile estratto dalla pagina."
+        )
+
+    declared_count = extract_declared_count(
+        visible,
+        year,
+    )
+
+    # ----------------------------------------------------------------------
+    # PRIMO TENTATIVO:
+    # formato storico con "Concorso n."
+    # ----------------------------------------------------------------------
 
     records = []
 
-    for pos, (start, contest) in enumerate(positions):
-        end = positions[pos + 1][0] if pos + 1 < len(positions) else len(lines)
-        block_lines = lines[start:end]
-        block = " ".join(block_lines)
+    contest_matches = list(
+        CONTEST_DATE_RE.finditer(visible)
+    )
 
-        date_match = DATE_RE.search(block)
-        if not date_match:
-            log(f"WARNING: anno {year}, concorso {contest}: data non riconosciuta.")
-            continue
+    if contest_matches:
+        for idx, match in enumerate(contest_matches):
 
-        date_value = pd.to_datetime(
-            date_match.group(1),
-            dayfirst=True,
-            errors="coerce",
-        )
-        if pd.isna(date_value) or date_value.year != year:
-            log(f"WARNING: anno {year}, concorso {contest}: data non valida.")
-            continue
+            contest = int(match.group(1))
+            date_text = match.group(2)
 
-        # From this point onward, the first six numeric tokens are the
-        # six SuperEnalotto main numbers. Jolly is deliberately ignored.
-        main_text = block[date_match.end():]
-        numbers = [int(x) for x in NUMBER_RE.findall(main_text)][:NUMBERS_PER_DRAW]
+            body_start = match.end()
 
-        if len(numbers) != NUMBERS_PER_DRAW:
-            log(
-                f"WARNING: anno {year}, concorso {contest}: "
-                f"trovati meno di {NUMBERS_PER_DRAW} numeri principali."
-            )
-            continue
+            if idx + 1 < len(contest_matches):
+                body_end = contest_matches[idx + 1].start()
+            else:
+                body_end = len(visible)
 
-        if any(x < VALID_NUMBERS_MIN or x > VALID_NUMBERS_MAX for x in numbers):
-            log(
-                f"WARNING: anno {year}, concorso {contest}: "
-                "numero principale fuori range 1..90; record scartato."
-            )
-            continue
+            body = visible[body_start:body_end]
 
-        if len(set(numbers)) != NUMBERS_PER_DRAW:
-            log(
-                f"WARNING: anno {year}, concorso {contest}: "
-                "numeri principali duplicati; record scartato."
-            )
-            continue
+            try:
+                numbers = extract_first_six_main_numbers(
+                    body
+                )
 
-        records.append(
-            {
-                "data": pd.Timestamp(date_value).normalize(),
-                "year": int(year),
-                "concorso": int(contest),
+                numbers = validate_numbers(
+                    list(numbers),
+                    year,
+                    contest,
+                    date_text,
+                )
+
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Anno {year}, concorso {contest}: "
+                    f"record non interpretabile: {exc}"
+                ) from exc
+
+            records.append({
+                "year": year,
+                "data": datetime.strptime(
+                    date_text,
+                    "%d/%m/%Y",
+                ).date().isoformat(),
+                "concorso": contest,
                 "n1": numbers[0],
                 "n2": numbers[1],
                 "n3": numbers[2],
                 "n4": numbers[3],
                 "n5": numbers[4],
                 "n6": numbers[5],
-            }
-        )
+            })
+
+    # ----------------------------------------------------------------------
+    # SECONDO TENTATIVO:
+    # formato moderno "SuperEnalotto DD/MM/YYYY"
+    #
+    # Questo è necessario perché l'archivio 2016, per esempio, non espone
+    # "Concorso n." nel testo visibile ma "SuperEnalotto data".
+    # ----------------------------------------------------------------------
 
     if not records:
+
+        modern_matches = list(
+            MODERN_DRAW_RE.finditer(visible)
+        )
+
+        if not modern_matches:
+            raise RuntimeError(
+                f"Anno {year}: nessuna estrazione riconosciuta "
+                f"né con formato 'Concorso n.' né con "
+                f"formato 'SuperEnalotto data'."
+            )
+
+        # In questo formato il numero di concorso non è stampato.
+        # Deve essere ricostruito dalla posizione cronologica.
+        #
+        # La pagina è in ordine decrescente:
+        # ultimo concorso -> primo concorso.
+        #
+        # Quindi, dopo aver parsato tutte le date, assegniamo i concorsi
+        # in ordine crescente.
+        temp_records = []
+
+        for idx, match in enumerate(modern_matches):
+
+            date_text = match.group(1)
+
+            body_start = match.end()
+
+            if idx + 1 < len(modern_matches):
+                body_end = modern_matches[idx + 1].start()
+            else:
+                body_end = len(visible)
+
+            body = visible[body_start:body_end]
+
+            try:
+                numbers = extract_first_six_main_numbers(
+                    body
+                )
+
+                numbers = validate_numbers(
+                    list(numbers),
+                    year,
+                    0,
+                    date_text,
+                )
+
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Anno {year}, data {date_text}: "
+                    f"record non interpretabile: {exc}"
+                ) from exc
+
+            temp_records.append({
+                "year": year,
+                "data": datetime.strptime(
+                    date_text,
+                    "%d/%m/%Y",
+                ).date().isoformat(),
+                "n1": numbers[0],
+                "n2": numbers[1],
+                "n3": numbers[2],
+                "n4": numbers[3],
+                "n5": numbers[4],
+                "n6": numbers[5],
+            })
+
+        # Le pagine sono in ordine decrescente.
+        # Le invertiamo per ottenere cronologia crescente.
+        temp_records.sort(
+            key=lambda x: x["data"]
+        )
+
+        if len(temp_records) != declared_count:
+            raise RuntimeError(
+                f"Anno {year}: parser moderno ha prodotto "
+                f"{len(temp_records)} estrazioni, "
+                f"ma la pagina dichiara {declared_count}."
+            )
+
+        # Assegna 1..N.
+        #
+        # Caso storico 1997 escluso: quello usa il formato Concorso n.
+        #
+        for contest_number, record in enumerate(
+            temp_records,
+            start=1,
+        ):
+            record["concorso"] = contest_number
+
+        records = temp_records
+
+    # ----------------------------------------------------------------------
+    # AUDIT BASE
+    # ----------------------------------------------------------------------
+
+    if len(records) != declared_count:
         raise RuntimeError(
-            f"Anno {year}: nessuna estrazione valida prodotta dal parser."
+            f"Anno {year}: {len(records)} estrazioni parsate "
+            f"contro {declared_count} dichiarate dalla fonte."
         )
 
     df = pd.DataFrame(records)
-    dup = df.duplicated(subset=["year", "concorso"], keep=False)
-    if dup.any():
-        conflict = df.loc[dup].drop_duplicates()
-        if len(conflict) > 1:
-            raise RuntimeError(
-                f"Anno {year}: conflitto interno sul medesimo numero di concorso."
-            )
-        df = df.drop_duplicates(subset=["year", "concorso"])
 
-    return df.sort_values(["data", "concorso"]).reset_index(drop=True)
-
-
-def download_and_build_archive():
-    frames = []
-    source_years = list(range(REQUIRED_START_YEAR, CURRENT_YEAR + 1))
-
-    for year in source_years:
-        html = fetch_year_page(year)
-        frame = parse_annual_page(html, year)
-        log(
-            f"Anno {year}: {len(frame)} estrazioni valide; "
-            f"concorsi {int(frame['concorso'].min())}->{int(frame['concorso'].max())}."
-        )
-        frames.append(frame)
-
-    if not frames:
-        raise RuntimeError("Nessun anno recuperato.")
-
-    return pd.concat(frames, ignore_index=True), source_years
-
-
-def normalize_archive(df):
-    required = ["data", "year", "concorso", "n1", "n2", "n3", "n4", "n5", "n6"]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise RuntimeError("Colonne mancanti dopo parsing: " + ", ".join(missing))
-
-    df = df.copy()
-    df["data"] = pd.to_datetime(df["data"], errors="coerce")
-    for col in ["year", "concorso", "n1", "n2", "n3", "n4", "n5", "n6"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    df = df.dropna(subset=required).copy()
-    for col in ["year", "concorso", "n1", "n2", "n3", "n4", "n5", "n6"]:
-        df[col] = df[col].astype(int)
-    df = df[df["year"].between(REQUIRED_START_YEAR, CURRENT_YEAR)].copy()
-    return df.sort_values(["year", "data", "concorso"]).reset_index(drop=True)
-
-
-# ============================================================
-# RISOLUZIONE DUPLICATI
-# ============================================================
-
-def resolve_duplicates_strict(df):
-    key = ["year", "concorso"]
-    full = ["year", "concorso", "data", "n1", "n2", "n3", "n4", "n5", "n6"]
-    initial_len = len(df)
-    exact = df.drop_duplicates(subset=full).copy()
-    removed_exact = initial_len - len(exact)
-    if removed_exact:
-        log(f"Rimosse {removed_exact} duplicazioni perfettamente identiche.")
-
-    conflicts = exact[exact.duplicated(subset=key, keep=False)].copy()
-    if not conflicts.empty:
-        log("ERRORE FATALE: conflitto sullo stesso (anno, concorso):")
-        log(conflicts[full].to_string(index=False))
-        return None, f"Conflitto dati irreconciliabile su {len(conflicts)} righe."
-
-    return exact.sort_values(["year", "data", "concorso"]).reset_index(drop=True), None
-
-
-# ============================================================
-# AUDIT STRUTTURALE
-# ============================================================
-
-def audit_structure(df):
-    errors, warnings = [], []
-    required = ["data", "year", "concorso", "n1", "n2", "n3", "n4", "n5", "n6"]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        errors.append("Colonne mancanti: " + ", ".join(missing))
-        return errors, warnings
-    if df.empty:
-        errors.append("Dataset vuoto.")
-        return errors, warnings
-    if len(df) < MIN_TOTAL_RECORDS:
-        errors.append(f"Numero totale di estrazioni insufficiente: {len(df)} < {MIN_TOTAL_RECORDS}.")
-    if df["concorso"].le(0).any():
-        errors.append("Presenti numeri di concorso <= 0.")
-    if df["data"].isna().any():
-        errors.append("Presenti date non valide.")
-    if (~df["year"].between(REQUIRED_START_YEAR, CURRENT_YEAR)).any():
-        errors.append(f"Presenti anni fuori dall'intervallo {REQUIRED_START_YEAR}-{CURRENT_YEAR}.")
-
-    for col in ["n1", "n2", "n3", "n4", "n5", "n6"]:
-        invalid = ~df[col].between(1, 90)
-        if invalid.any():
-            errors.append(f"Valori fuori range 1..90 in {col}: {int(invalid.sum())}.")
-
-    duplicate_numbers = []
-    for index, row in df.iterrows():
-        values = [int(row[f"n{i}"]) for i in range(1, 7)]
-        if len(set(values)) != 6:
-            duplicate_numbers.append(index)
-    if duplicate_numbers:
-        errors.append(f"Estrazioni con numeri principali duplicati: {len(duplicate_numbers)}.")
-
-    mismatch = df["data"].dt.year != df["year"]
-    if mismatch.any():
-        errors.append(f"Incoerenza tra anno e data: {int(mismatch.sum())} record.")
-
-    if df.duplicated(subset=["year", "concorso"], keep=False).any():
-        errors.append("Chiave (anno, concorso) non univoca.")
-
-    return errors, warnings
-
-
-# ============================================================
-# AUDIT COPERTURA TEMPORALE
-# ============================================================
-
-def audit_coverage(df):
-    errors, warnings = [], []
-    years_present = set(int(v) for v in df["year"].unique())
-    expected_years = set(range(REQUIRED_START_YEAR, CURRENT_YEAR + 1))
-    missing_years = sorted(expected_years - years_present)
-    if missing_years:
-        errors.append("Anni completamente mancanti: " + ", ".join(map(str, missing_years)))
-
-    yearly_counts = df.groupby("year").size().to_dict()
-
-    # Il 1997 è il primo anno di attività e contiene solo le 9
-    # estrazioni ufficiali dal 03/12/1997 al 31/12/1997. Non è quindi
-    # un anno storico completo e non può essere sottoposto al minimo
-    # di 80 estrazioni previsto per gli anni completi.
-    for year in range(REQUIRED_START_YEAR, CURRENT_YEAR):
-        count = int(yearly_counts.get(year, 0))
-        if year == REQUIRED_START_YEAR:
-            if count <= 0:
-                errors.append(
-                    f"Anno {year}: nessuna estrazione ufficiale presente."
-                )
-            continue
-        if count < MIN_HISTORICAL_DRAWS_PER_YEAR:
-            errors.append(
-                f"Anno {year}: solo {count} estrazioni; minimo richiesto {MIN_HISTORICAL_DRAWS_PER_YEAR}."
-            )
-
-    current_count = int(yearly_counts.get(CURRENT_YEAR, 0))
-    if current_count <= 0:
-        errors.append(f"Nessuna estrazione presente per l'anno corrente {CURRENT_YEAR}.")
-
-    windows = [
-        ("training", TRAINING_START_YEAR, TRAINING_END_YEAR),
-        ("discovery", DISCOVERY_START_YEAR, DISCOVERY_END_YEAR),
-        ("confirmation", CONFIRMATION_START_YEAR, CURRENT_YEAR),
+    expected_columns = [
+        "year",
+        "data",
+        "concorso",
+        "n1",
+        "n2",
+        "n3",
+        "n4",
+        "n5",
+        "n6",
     ]
-    for name, start, end in windows:
-        if df[df["year"].between(start, end)].empty:
-            errors.append(f"Finestra {name} completamente vuota.")
 
-    # Contest numbering is annual on this archive. Check gaps within each year only.
-    for year, group in df.groupby("year"):
-        contests = sorted(group["concorso"].astype(int).tolist())
-        gaps = []
-        for previous, current in zip(contests, contests[1:]):
-            if current > previous + 1:
-                gaps.append((previous, current, current - previous - 1))
-        if gaps:
-            warnings.append(
-                f"Anno {int(year)}: buchi nella sequenza dei concorsi: "
-                + "; ".join(f"{a}->{b} (mancano {n})" for a, b, n in gaps[:10])
-            )
-        if not group.sort_values("concorso")["data"].is_monotonic_increasing:
-            errors.append(
-                f"Anno {int(year)}: data non monotona rispetto al numero di concorso."
-            )
-
-    return errors, warnings
-
-
-# ============================================================
-# AUDIT CROSS-YEAR
-# ============================================================
-
-def audit_global_contest_consistency(df):
-    errors, warnings = [], []
-    repeated = df.groupby("concorso")["year"].nunique()
-    if (repeated > 1).any():
-        warnings.append(
-            "Numeri di concorso ricorrenti in anni diversi: "
-            "comportamento atteso perché la numerazione è annuale."
+    if list(df.columns) != expected_columns:
+        raise RuntimeError(
+            f"Anno {year}: colonne inattese: "
+            f"{list(df.columns)}"
         )
-    return errors, warnings
+
+    # Nessun concorso duplicato nello stesso anno.
+    dup = df.duplicated(
+        subset=["year", "concorso"],
+        keep=False,
+    )
+
+    if dup.any():
+        bad = df.loc[
+            dup,
+            ["year", "concorso", "data"]
+        ].to_dict("records")
+
+        raise RuntimeError(
+            f"Anno {year}: concorsi duplicati: {bad[:10]}"
+        )
+
+    # Tutte le date devono appartenere all'anno.
+    years = pd.to_datetime(
+        df["data"]
+    ).dt.year
+
+    if not (years == year).all():
+        raise RuntimeError(
+            f"Anno {year}: trovate date appartenenti "
+            f"a un altro anno."
+        )
+
+    # ----------------------------------------------------------------------
+    # CONTROLLO CONCORSI
+    # ----------------------------------------------------------------------
+
+    contests = sorted(
+        df["concorso"].astype(int).tolist()
+    )
+
+    if year == 1997:
+        expected = list(range(87, 96))
+
+        if contests != expected:
+            raise RuntimeError(
+                f"Anno 1997: sequenza concorsi inattesa: "
+                f"{contests}; attesa {expected}."
+            )
+
+    else:
+        expected = list(
+            range(
+                min(contests),
+                max(contests) + 1,
+            )
+        )
+
+        if contests != expected:
+            raise RuntimeError(
+                f"Anno {year}: numerazione concorsi "
+                f"non consecutiva."
+            )
+
+        if len(contests) != declared_count:
+            raise RuntimeError(
+                f"Anno {year}: numero concorsi "
+                f"{len(contests)} diverso da "
+                f"conteggio dichiarato {declared_count}."
+            )
+
+    # ----------------------------------------------------------------------
+    # CONTROLLO DATE
+    # ----------------------------------------------------------------------
+
+    parsed_dates = pd.to_datetime(
+        df["data"]
+    )
+
+    if not parsed_dates.is_monotonic_increasing:
+        raise RuntimeError(
+            f"Anno {year}: date non monotone."
+        )
+
+    log(
+        f"Anno {year}: {len(df)} estrazioni valide; "
+        f"concorsi {contests[0]}->{contests[-1]}."
+    )
+
+    metadata = {
+        "year": year,
+        "declared_count": declared_count,
+        "parsed_count": len(df),
+        "first_contest": contests[0],
+        "last_contest": contests[-1],
+        "parser_mode": (
+            "CONCORSO"
+            if contest_matches
+            else "MODERN_SUPERENALOTTO"
+        ),
+    }
+
+    return df, metadata
 
 
-# ============================================================
-# SALVATAGGIO DATASET
-# ============================================================
+# ============================================================================
+# AUDIT GLOBALE
+# ============================================================================
 
-def export_dataset(df):
-    export_df = df[
-        [
-            "data",
-            "concorso",
-            "n1",
-            "n2",
-            "n3",
-            "n4",
-            "n5",
-            "n6",
+def audit_global(
+    df: pd.DataFrame,
+    metadata: list[dict],
+) -> list[str]:
+    errors = []
+
+    # ----------------------------------------------------------------------
+    # Schema
+    # ----------------------------------------------------------------------
+
+    expected_columns = [
+        "year",
+        "data",
+        "concorso",
+        "n1",
+        "n2",
+        "n3",
+        "n4",
+        "n5",
+        "n6",
+    ]
+
+    if list(df.columns) != expected_columns:
+        errors.append(
+            "Schema colonne globale non conforme."
+        )
+
+    # ----------------------------------------------------------------------
+    # Righe duplicate
+    # ----------------------------------------------------------------------
+
+    if df.duplicated().any():
+        errors.append(
+            "Esistono righe completamente duplicate."
+        )
+
+    # ----------------------------------------------------------------------
+    # Chiave primaria logica
+    # ----------------------------------------------------------------------
+
+    if df.duplicated(
+        subset=["year", "concorso"]
+    ).any():
+        errors.append(
+            "Chiave (year, concorso) duplicata."
+        )
+
+    # ----------------------------------------------------------------------
+    # Numeri
+    # ----------------------------------------------------------------------
+
+    number_columns = [
+        "n1",
+        "n2",
+        "n3",
+        "n4",
+        "n5",
+        "n6",
+    ]
+
+    for col in number_columns:
+
+        if df[col].isna().any():
+            errors.append(
+                f"{col}: valori mancanti."
+            )
+
+        values = pd.to_numeric(
+            df[col],
+            errors="coerce",
+        )
+
+        if values.isna().any():
+            errors.append(
+                f"{col}: valori non numerici."
+            )
+
+        if not values.between(
+            MIN_NUMBER,
+            MAX_NUMBER,
+        ).all():
+            errors.append(
+                f"{col}: valore fuori intervallo 1-90."
+            )
+
+    # ----------------------------------------------------------------------
+    # Sei numeri distinti per estrazione
+    # ----------------------------------------------------------------------
+
+    for row_idx, row in df.iterrows():
+
+        nums = [
+            int(row[col])
+            for col in number_columns
         ]
-    ].copy()
 
-    export_df["data"] = export_df[
-        "data"
-    ].dt.strftime("%Y-%m-%d")
+        if len(set(nums)) != MAIN_NUMBERS:
+            errors.append(
+                "Numeri duplicati nella riga "
+                f"{row_idx}: {nums}"
+            )
+
+    # ----------------------------------------------------------------------
+    # Date
+    # ----------------------------------------------------------------------
+
+    dates = pd.to_datetime(
+        df["data"],
+        errors="coerce",
+    )
+
+    if dates.isna().any():
+        errors.append(
+            "Esistono date non valide."
+        )
+
+    # ----------------------------------------------------------------------
+    # Controllo anni
+    # ----------------------------------------------------------------------
+
+    if not df.empty:
+
+        min_year = int(
+            pd.to_datetime(df["data"]).dt.year.min()
+        )
+
+        max_year = int(
+            pd.to_datetime(df["data"]).dt.year.max()
+        )
+
+        if min_year != START_YEAR:
+            errors.append(
+                f"Primo anno trovato {min_year}, "
+                f"atteso {START_YEAR}."
+            )
+
+        if max_year != END_YEAR:
+            errors.append(
+                f"Ultimo anno trovato {max_year}, "
+                f"atteso {END_YEAR}."
+            )
+
+    # ----------------------------------------------------------------------
+    # Controllo copertura annuale
+    # ----------------------------------------------------------------------
+
+    meta_by_year = {
+        int(x["year"]): x
+        for x in metadata
+    }
+
+    for year in range(
+        START_YEAR,
+        END_YEAR + 1,
+    ):
+
+        if year not in meta_by_year:
+            errors.append(
+                f"Anno {year}: assente dai metadati."
+            )
+            continue
+
+        meta = meta_by_year[year]
+
+        if (
+            meta["declared_count"]
+            != meta["parsed_count"]
+        ):
+            errors.append(
+                f"Anno {year}: conteggio dichiarato "
+                f"{meta['declared_count']} != "
+                f"conteggio parsato "
+                f"{meta['parsed_count']}."
+            )
+
+    # ----------------------------------------------------------------------
+    # Ordinamento globale
+    # ----------------------------------------------------------------------
+
+    sorted_df = df.sort_values(
+        ["data", "year", "concorso"]
+    ).reset_index(drop=True)
+
+    if not df.reset_index(drop=True).equals(
+        sorted_df
+    ):
+        # Non è necessariamente errore strutturale perché il download
+        # avviene per anno; riordiniamo comunque prima dell'export.
+        pass
+
+    return errors
+
+
+# ============================================================================
+# DOWNLOAD + BUILD
+# ============================================================================
+
+def download_and_build_archive() -> tuple[
+    pd.DataFrame,
+    list[dict],
+]:
+    all_frames = []
+    metadata = []
+
+    for year in range(
+        START_YEAR,
+        END_YEAR + 1,
+    ):
+
+        html = fetch_year_page(year)
+
+        try:
+            df_year, meta = parse_annual_page(
+                html,
+                year,
+            )
+
+        except Exception as exc:
+
+            log(
+                f"ERRORE CRITICO anno {year}: {exc}"
+            )
+
+            raise
+
+        all_frames.append(df_year)
+        metadata.append(meta)
+
+    if not all_frames:
+        raise RuntimeError(
+            "Nessun dato prodotto dall'archivio."
+        )
+
+    df = pd.concat(
+        all_frames,
+        ignore_index=True,
+    )
+
+    df["year"] = df["year"].astype(int)
+    df["concorso"] = df["concorso"].astype(int)
+
+    for col in [
+        "n1",
+        "n2",
+        "n3",
+        "n4",
+        "n5",
+        "n6",
+    ]:
+        df[col] = df[col].astype(int)
+
+    df["data"] = pd.to_datetime(
+        df["data"],
+        errors="raise",
+    ).dt.strftime("%Y-%m-%d")
+
+    # Ordine cronologico definitivo.
+    df = df.sort_values(
+        ["data", "concorso"]
+    ).reset_index(drop=True)
+
+    return df, metadata
+
+
+# ============================================================================
+# REPORT
+# ============================================================================
+
+def write_report(
+    status: str,
+    df: pd.DataFrame | None,
+    metadata: list[dict],
+    errors: list[str],
+    warnings: list[str],
+) -> None:
+
+    report = {
+        "pipeline_version": PIPELINE_VERSION,
+        "generated_at": datetime.now().isoformat(),
+        "status": status,
+        "engine_enabled": ENGINE_ENABLED,
+        "source": "estrazioni.it",
+        "source_url_pattern": SOURCE_BASE,
+        "start_year": START_YEAR,
+        "end_year": END_YEAR,
+        "total_records": (
+            int(len(df))
+            if df is not None
+            else 0
+        ),
+        "years": metadata,
+        "errors": errors,
+        "warnings": warnings,
+    }
+
+    Path(REPORT_JSON).write_text(
+        json.dumps(
+            report,
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    log(
+        f"Report di integrità generato in "
+        f"'{REPORT_JSON}'."
+    )
+
+
+# ============================================================================
+# EXPORT
+# ============================================================================
+
+def export_csv(df: pd.DataFrame) -> None:
+
+    export_columns = [
+        "data",
+        "concorso",
+        "n1",
+        "n2",
+        "n3",
+        "n4",
+        "n5",
+        "n6",
+    ]
+
+    export_df = df[
+        export_columns
+    ].copy()
 
     export_df.to_csv(
         OUTPUT_CSV,
@@ -697,263 +1110,212 @@ def export_dataset(df):
         encoding="utf-8",
     )
 
-    if not os.path.exists(OUTPUT_CSV):
+    log(
+        f"Archivio esportato in '{OUTPUT_CSV}' "
+        f"({len(export_df)} righe)."
+    )
+
+
+# ============================================================================
+# ENGINE
+# ============================================================================
+
+def run_engine_disabled() -> None:
+    """
+    Placeholder intenzionale.
+
+    Nessun test statistico viene eseguito in questa versione.
+    """
+
+    if ENGINE_ENABLED:
         raise RuntimeError(
-            "Export fallito: il file CSV non esiste."
-        )
-
-    if os.path.getsize(OUTPUT_CSV) <= 0:
-        raise RuntimeError(
-            "Export fallito: il file CSV è vuoto."
+            "ENGINE_ENABLED=True ma il motore V5.3 "
+            "non è autorizzato in questa fase."
         )
 
     log(
-        f"Dataset validato esportato in "
-        f"'{OUTPUT_CSV}'."
+        "ENGINE DISABLED — nessun test statistico eseguito."
     )
 
 
-# ============================================================
-# PIPELINE PRINCIPALE — AUDIT ONLY
-# ============================================================
-
-def run_strict_data_audit():
-    log("")
-    log("=======================================================")
-    log(
-        "SUPERNALOTTO PIPELINE V5.2.6 "
-        "— STRICT DATA INTEGRITY AUDIT"
-    )
-    log("ENGINE DISABLED")
-    log("=======================================================")
-    log(
-        f"Anno richiesto iniziale: "
-        f"{REQUIRED_START_YEAR}"
-    )
-    log(
-        f"Anno corrente rilevato: "
-        f"{CURRENT_YEAR}"
-    )
-    log(
-        "Training: "
-        f"{TRAINING_START_YEAR}-{TRAINING_END_YEAR}"
-    )
-    log(
-        "Discovery: "
-        f"{DISCOVERY_START_YEAR}-{DISCOVERY_END_YEAR}"
-    )
-    log(
-        "Confirmation: "
-        f"{CONFIRMATION_START_YEAR}-{CURRENT_YEAR}"
-    )
-    log("=======================================================")
-
-    errors = []
-    warnings = []
-    df = None
-
-    # Fail-closed: nessun vecchio dataset deve poter
-    # essere scambiato per un dataset appena validato.
-    try:
-        remove_stale_dataset()
-    except Exception as exc:
-        errors.append(str(exc))
-
-        write_report(
-            "FAILED",
-            0,
-            errors,
-            warnings,
-            None,
-        )
-
-        raise
-
-    # Acquisizione: pagine annuali esplicite.
-    # L'anno viene determinato dalla pagina annuale richiesta,
-    # evitando di ricostruirlo dal CSV globale.
-    try:
-        df, source_years = download_and_build_archive()
-        log(
-            f"Acquisizione completata: {len(source_years)} anni richiesti, "
-            f"{len(df)} record grezzi prodotti."
-        )
-    except Exception as exc:
-        errors.append(
-            f"Acquisizione/parsing archivio annuale fallita: {exc}"
-        )
-        write_report(
-            "FAILED",
-            0,
-            errors,
-            warnings,
-            None,
-        )
-        raise
-
-    # Normalizzazione finale dei tipi e dell'intervallo temporale.
-    try:
-        df = normalize_archive(df)
-    except Exception as exc:
-        errors.append(
-            f"Normalizzazione finale fallita: {exc}"
-        )
-        write_report(
-            "FAILED",
-            0,
-            errors,
-            warnings,
-            None,
-        )
-        raise
-
-    # Duplicati.
-    try:
-        df, duplicate_error = (
-            resolve_duplicates_strict(df)
-        )
-
-        if duplicate_error:
-            errors.append(duplicate_error)
-
-    except Exception as exc:
-        errors.append(
-            f"Controllo duplicati fallito: {exc}"
-        )
-        df = None
-
-    if df is not None:
-        structure_errors, structure_warnings = (
-            audit_structure(df)
-        )
-
-        coverage_errors, coverage_warnings = (
-            audit_coverage(df)
-        )
-
-        global_errors, global_warnings = (
-            audit_global_contest_consistency(df)
-        )
-
-        errors.extend(structure_errors)
-        errors.extend(coverage_errors)
-        errors.extend(global_errors)
-
-        warnings.extend(structure_warnings)
-        warnings.extend(coverage_warnings)
-        warnings.extend(global_warnings)
-
-    total_records = (
-        len(df)
-        if df is not None
-        else 0
-    )
-
-    if errors:
-        status = "FAILED"
-
-        write_report(
-            status,
-            total_records,
-            errors,
-            warnings,
-            df,
-        )
-
-        log("")
-        log("=======================================================")
-        log("AUDIT FALLITO — FAIL-CLOSED")
-        log("=======================================================")
-
-        for error in errors:
-            log(f"ERRORE: {error}")
-
-        if warnings:
-            log("")
-            for warning in warnings:
-                log(f"WARNING: {warning}")
-
-        log("")
-        log(
-            "Nessun nuovo dataset validato è stato "
-            "esportato."
-        )
-        log(
-            "ENGINE DISABLED — nessuna analisi "
-            "statistica eseguita."
-        )
-
-        raise RuntimeError(
-            "Audit di integrità fallito. "
-            "Consultare integrity_report.json."
-        )
-
-    # Se non ci sono errori, warnings consentiti.
-    if warnings:
-        status = "VALID_WITH_WARNINGS"
-    else:
-        status = "VERIFIED_VALID"
-
-    try:
-        export_dataset(df)
-    except Exception as exc:
-        errors.append(
-            f"Esportazione dataset fallita: {exc}"
-        )
-
-        write_report(
-            "FAILED",
-            total_records,
-            errors,
-            warnings,
-            df,
-        )
-
-        raise
-
-    write_report(
-        status,
-        total_records,
-        errors,
-        warnings,
-        df,
-    )
-
-    log("")
-    log("=======================================================")
-    log(f"AUDIT COMPLETATO: {status}")
-    log("=======================================================")
-    log(
-        f"Totale estrazioni valide: "
-        f"{total_records}"
-    )
-    log(
-        f"Intervallo date: "
-        f"{df['data'].min().date()} -> "
-        f"{df['data'].max().date()}"
-    )
-    log(
-        f"Concorso: "
-        f"{int(df['concorso'].min())} -> "
-        f"{int(df['concorso'].max())}"
-    )
-
-    if warnings:
-        log("")
-        for warning in warnings:
-            log(f"WARNING: {warning}")
-
-    log("")
-    log(
-        "ENGINE DISABLED — audit dati completato. "
-        "Nessuna generazione di numeri."
-    )
-    log("=======================================================")
-
-
-# ============================================================
+# ============================================================================
 # MAIN
-# ============================================================
+# ============================================================================
+
+def main() -> int:
+
+    log(
+        f"SUPERNALOTTO PIPELINE {PIPELINE_VERSION} "
+        f"— STRICT DATA INTEGRITY AUDIT"
+    )
+
+    log(
+        "ENGINE DISABLED"
+    )
+
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    df = None
+    metadata: list[dict] = []
+
+    try:
+
+        # --------------------------------------------------------------
+        # 1. DOWNLOAD + PARSING
+        # --------------------------------------------------------------
+
+        df, metadata = download_and_build_archive()
+
+        log(
+            f"Acquisizione completata: "
+            f"{len(metadata)} anni, "
+            f"{len(df)} estrazioni."
+        )
+
+        # --------------------------------------------------------------
+        # 2. AUDIT GLOBALE
+        # --------------------------------------------------------------
+
+        errors.extend(
+            audit_global(
+                df,
+                metadata,
+            )
+        )
+
+        # --------------------------------------------------------------
+        # 3. CHIAVE ANNUO/CONCORSO
+        # --------------------------------------------------------------
+
+        duplicates = df[
+            df.duplicated(
+                subset=[
+                    "year",
+                    "concorso",
+                ],
+                keep=False,
+            )
+        ]
+
+        if not duplicates.empty:
+
+            errors.append(
+                "Duplicati sulla chiave "
+                "(year, concorso)."
+            )
+
+        # --------------------------------------------------------------
+        # 4. CONTROLLO NUMERO TOTALE
+        # --------------------------------------------------------------
+
+        if len(df) < 1000:
+
+            errors.append(
+                f"Archivio globale sospettosamente corto: "
+                f"{len(df)} estrazioni."
+            )
+
+        # --------------------------------------------------------------
+        # 5. STATUS
+        # --------------------------------------------------------------
+
+        if errors:
+
+            write_report(
+                "FAILED",
+                df,
+                metadata,
+                errors,
+                warnings,
+            )
+
+            log(
+                "AUDIT FAILED — archivio NON utilizzabile."
+            )
+
+            for error in errors:
+                log(f"ERROR: {error}")
+
+            return 1
+
+        # --------------------------------------------------------------
+        # 6. EXPORT
+        # --------------------------------------------------------------
+
+        export_csv(df)
+
+        # --------------------------------------------------------------
+        # 7. REPORT PASS
+        # --------------------------------------------------------------
+
+        write_report(
+            "PASSED",
+            df,
+            metadata,
+            errors,
+            warnings,
+        )
+
+        log(
+            "=================================================="
+        )
+        log(
+            "AUDIT PASSED"
+        )
+        log(
+            f"Estrazioni valide: {len(df)}"
+        )
+        log(
+            f"Periodo: {df['data'].min()} -> "
+            f"{df['data'].max()}"
+        )
+        log(
+            "Nessuna anomalia strutturale rilevata."
+        )
+        log(
+            "Il motore statistico resta DISABILITATO."
+        )
+        log(
+            "=================================================="
+        )
+
+        run_engine_disabled()
+
+        return 0
+
+    except Exception as exc:
+
+        errors.append(
+            f"Eccezione fatale: {type(exc).__name__}: {exc}"
+        )
+
+        try:
+            write_report(
+                "FAILED",
+                df,
+                metadata,
+                errors,
+                warnings,
+            )
+        except Exception:
+            pass
+
+        log(
+            "=================================================="
+        )
+        log(
+            "AUDIT FAILED — FAIL CLOSED"
+        )
+        log(
+            f"{type(exc).__name__}: {exc}"
+        )
+        log(
+            "=================================================="
+        )
+
+        return 1
+
 
 if __name__ == "__main__":
-    run_strict_data_audit()
+    sys.exit(main())
