@@ -19,6 +19,7 @@ import re
 import time
 from datetime import datetime
 from io import StringIO
+from html.parser import HTMLParser
 
 import pandas as pd
 import requests
@@ -327,488 +328,160 @@ def parse_contest_value(value):
 
 
 # ============================================================
-# DOWNLOAD BOOTSTRAP
+# ANNUAL ARCHIVE ACQUISITION
 # ============================================================
 
-def download_bootstrap():
-    log("=======================================================")
-    log("DOWNLOAD ARCHIVIO BOOTSTRAP")
-    log("=======================================================")
-    log(f"Fonte: {BOOTSTRAP_URL}")
+OFFICIAL_ARCHIVE_BASE = "https://www.estrazioni.it/superenalotto/?anno={year}"
 
+
+class VisibleTextParser(HTMLParser):
+    """Dependency-free HTML visible-text extractor."""
+    def __init__(self):
+        super().__init__()
+        self.parts = []
+
+    def handle_data(self, data):
+        text = " ".join(data.split())
+        if text:
+            self.parts.append(text)
+
+
+def html_to_text_lines(html):
+    parser = VisibleTextParser()
+    parser.feed(html)
+    parser.close()
+    return parser.parts
+
+
+def fetch_year_page(year):
+    url = OFFICIAL_ARCHIVE_BASE.format(year=year)
     last_error = None
 
     for attempt in range(1, HTTP_RETRIES + 1):
         try:
-            log(
-                f"Tentativo {attempt}/{HTTP_RETRIES}..."
-            )
-
-            response = SESSION.get(
-                BOOTSTRAP_URL,
-                timeout=HTTP_TIMEOUT,
-            )
+            log(f"WEB FETCH {year} (tentativo {attempt}/{HTTP_RETRIES})")
+            response = SESSION.get(url, timeout=HTTP_TIMEOUT)
             response.raise_for_status()
-
-            content = response.content
-
-            if not content:
-                raise ValueError(
-                    "Risposta HTTP vuota."
-                )
-
-            # Decodifica robusta per CSV italiani.
-            text = None
-
-            for encoding in (
-                "utf-8-sig",
-                "utf-8",
-                "cp1252",
-                "latin-1",
-            ):
-                try:
-                    text = content.decode(
-                        encoding,
-                        errors="strict",
-                    )
-                    break
-                except UnicodeDecodeError:
-                    continue
-
-            if text is None:
-                text = content.decode(
-                    "latin-1",
-                    errors="replace",
-                )
-
-            text = text.strip()
-
-            if not text:
-                raise ValueError(
-                    "Testo CSV vuoto dopo la decodifica."
-                )
-
-            log(
-                "Download completato: "
-                f"{len(content)} byte / "
-                f"{len(text)} caratteri."
-            )
-
-            return text
-
+            if not response.content:
+                raise RuntimeError("Risposta HTTP vuota.")
+            response.encoding = response.apparent_encoding or "utf-8"
+            html = response.text
+            if len(html.strip()) < 1000:
+                raise RuntimeError("Pagina HTML anormalmente corta.")
+            return html
         except Exception as exc:
             last_error = exc
-            log(
-                f"Fallito tentativo {attempt}: {exc}"
-            )
-
+            log(f"FETCH {year} fallito: {exc}")
             if attempt < HTTP_RETRIES:
                 time.sleep(HTTP_RETRY_SLEEP)
 
-    raise RuntimeError(
-        "Impossibile scaricare il bootstrap dopo "
-        f"{HTTP_RETRIES} tentativi: {last_error}"
-    )
+    raise RuntimeError(f"Impossibile recuperare l'archivio {year}: {last_error}")
 
 
-# ============================================================
-# LETTURA CSV DIFENSIVA
-# ============================================================
-
-def detect_separator(csv_text):
-    sample = csv_text[:10000]
-
-    candidates = {
-        ",": sample.count(","),
-        ";": sample.count(";"),
-        "\t": sample.count("\t"),
-        "|": sample.count("|"),
-    }
-
-    separator = max(
-        candidates,
-        key=candidates.get,
-    )
-
-    if candidates[separator] == 0:
-        return None
-
-    return separator
+CONTEST_RE = re.compile(r"Concorso\s*(?:n\.?|N\.?|№)\s*(\d+)", re.IGNORECASE)
+DATE_RE = re.compile(r"\b(\d{1,2}/\d{1,2}/\d{4})\b")
+NUMBER_RE = re.compile(r"(?<!\d)(\d{1,2})(?!\d)")
 
 
-def read_raw_csv(csv_text):
-    """
-    Tenta più modalità di lettura.
-    Restituisce il DataFrame con il maggior numero
-    di colonne plausibili.
-    """
-    attempts = []
+def parse_annual_page(html, year):
+    """Parse one explicit annual SuperEnalotto archive page."""
+    lines = html_to_text_lines(html)
+    if not lines:
+        raise RuntimeError(f"Anno {year}: nessun testo visibile estratto.")
 
-    detected = detect_separator(csv_text)
+    positions = []
+    for idx, line in enumerate(lines):
+        m = CONTEST_RE.search(line)
+        if m:
+            positions.append((idx, int(m.group(1))))
 
-    if detected is not None:
-        attempts.append(detected)
+    if not positions:
+        raise RuntimeError(f"Anno {year}: nessun 'Concorso n.' riconosciuto.")
 
-    for sep in [",", ";", "\t", "|"]:
-        if sep not in attempts:
-            attempts.append(sep)
+    records = []
+    for pos, (start, contest) in enumerate(positions):
+        end = positions[pos + 1][0] if pos + 1 < len(positions) else len(lines)
+        block = " ".join(lines[start:end])
 
-    # Prima prova con header.
-    best_df = None
-    best_score = -1
-
-    for sep in attempts:
-        try:
-            df = pd.read_csv(
-                StringIO(csv_text),
-                sep=sep,
-                engine="python",
-                dtype=str,
-            )
-
-            if df.empty:
-                continue
-
-            score = len(df.columns)
-
-            column_text = " ".join(
-                normalize_col_name(c)
-                for c in df.columns
-            )
-
-            keywords = [
-                "concorso",
-                "data",
-                "n1",
-                "n2",
-                "n3",
-                "n4",
-                "n5",
-                "n6",
-                "numero",
-            ]
-
-            score += sum(
-                10
-                for word in keywords
-                if word in column_text
-            )
-
-            if score > best_score:
-                best_score = score
-                best_df = df
-
-        except Exception:
+        date_match = DATE_RE.search(block)
+        if not date_match:
+            log(f"WARNING: anno {year}, concorso {contest}: data non riconosciuta.")
             continue
 
-    if best_df is None:
-        raise ValueError(
-            "Impossibile interpretare il bootstrap "
-            "come CSV."
-        )
-
-    return best_df
-
-
-# ============================================================
-# IDENTIFICAZIONE COLONNE
-# ============================================================
-
-def find_number_columns(df):
-    columns = list(df.columns)
-
-    explicit = {}
-
-    for number in range(1, NUMBERS_PER_DRAW + 1):
-        patterns = [
-            rf"^n{number}$",
-            rf"^num{number}$",
-            rf"^numero{number}$",
-            rf"^estratto{number}$",
-            rf"^estrazion{number}$",
-            rf"^pallina{number}$",
-        ]
-
-        found = find_column(
-            columns,
-            patterns,
-        )
-
-        if found is not None:
-            explicit[number] = found
-
-    if len(explicit) == NUMBERS_PER_DRAW:
-        return [
-            explicit[i]
-            for i in range(1, NUMBERS_PER_DRAW + 1)
-        ]
-
-    # Ricerca di colonne chiaramente dedicate ai sei numeri.
-    candidates = []
-
-    excluded_patterns = [
-        "jolly",
-        "superstar",
-        "star",
-        "premio",
-        "jackpot",
-        "vincita",
-        "euro",
-        "categoria",
-        "quota",
-        "punti",
-        "id",
-        "concorso",
-        "data",
-        "anno",
-        "mese",
-    ]
-
-    for col in columns:
-        name = normalize_col_name(col)
-
-        if any(
-            token in name
-            for token in excluded_patterns
-        ):
+        date_value = pd.to_datetime(date_match.group(1), dayfirst=True, errors="coerce")
+        if pd.isna(date_value) or date_value.year != year:
+            log(f"WARNING: anno {year}, concorso {contest}: data non valida.")
             continue
 
-        if re.search(
-            r"(numero|num|n|estratto|pallina)",
-            name,
-        ):
-            candidates.append(col)
+        main_text = block[date_match.end():]
+        jolly_match = re.search(r"\bJolly\b", main_text, re.IGNORECASE)
+        if jolly_match:
+            main_text = main_text[:jolly_match.start()]
 
-    if len(candidates) >= NUMBERS_PER_DRAW:
-        return candidates[:NUMBERS_PER_DRAW]
-
-    # Fallback: colonne numeriche con prevalenza di valori 1..90.
-    numeric_candidates = []
-
-    for col in columns:
-        name = normalize_col_name(col)
-
-        if any(
-            token in name
-            for token in excluded_patterns
-        ):
+        numbers = [int(x) for x in NUMBER_RE.findall(main_text)]
+        if len(numbers) != 6:
+            log(f"WARNING: anno {year}, concorso {contest}: trovati {len(numbers)} numeri principali; record scartato.")
+            continue
+        if any(x < 1 or x > 90 for x in numbers) or len(set(numbers)) != 6:
+            log(f"WARNING: anno {year}, concorso {contest}: combinazione non valida; record scartato.")
             continue
 
-        parsed = df[col].map(parse_integer)
+        records.append({
+            "data": pd.Timestamp(date_value).normalize(),
+            "year": int(year),
+            "concorso": int(contest),
+            "n1": numbers[0], "n2": numbers[1], "n3": numbers[2],
+            "n4": numbers[3], "n5": numbers[4], "n6": numbers[5],
+        })
 
-        valid = parsed.between(
-            VALID_NUMBERS_MIN,
-            VALID_NUMBERS_MAX,
-            inclusive="both",
+    if not records:
+        raise RuntimeError(f"Anno {year}: nessuna estrazione valida prodotta dal parser.")
+
+    df = pd.DataFrame(records)
+    dup = df.duplicated(subset=["year", "concorso"], keep=False)
+    if dup.any():
+        conflict = df.loc[dup].drop_duplicates()
+        if len(conflict) > 1:
+            raise RuntimeError(f"Anno {year}: conflitto interno sul medesimo numero di concorso.")
+        df = df.drop_duplicates(subset=["year", "concorso"])
+
+    return df.sort_values(["data", "concorso"]).reset_index(drop=True)
+
+
+def download_and_build_archive():
+    frames = []
+    source_years = list(range(REQUIRED_START_YEAR, CURRENT_YEAR + 1))
+
+    for year in source_years:
+        html = fetch_year_page(year)
+        frame = parse_annual_page(html, year)
+        log(
+            f"Anno {year}: {len(frame)} estrazioni valide; "
+            f"concorsi {int(frame['concorso'].min())}->{int(frame['concorso'].max())}."
         )
+        frames.append(frame)
 
-        ratio = (
-            float(valid.mean())
-            if len(valid)
-            else 0.0
-        )
+    if not frames:
+        raise RuntimeError("Nessun anno recuperato.")
 
-        if ratio >= 0.90:
-            numeric_candidates.append(
-                (col, ratio)
-            )
-
-    numeric_candidates.sort(
-        key=lambda item: item[1],
-        reverse=True,
-    )
-
-    if len(numeric_candidates) >= NUMBERS_PER_DRAW:
-        return [
-            item[0]
-            for item in numeric_candidates[
-                :NUMBERS_PER_DRAW
-            ]
-        ]
-
-    raise ValueError(
-        "Impossibile identificare con certezza le "
-        "sei colonne dei numeri principali."
-    )
+    return pd.concat(frames, ignore_index=True), source_years
 
 
-def find_contest_column(df):
-    patterns = [
-        r"\bconcorso\b",
-        r"^contest$",
-        r"^contestno$",
-        r"^numeroestrazione$",
-        r"^numconcorso$",
-        r"^nconcorso$",
-    ]
+def normalize_archive(df):
+    required = ["data", "year", "concorso", "n1", "n2", "n3", "n4", "n5", "n6"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise RuntimeError("Colonne mancanti dopo parsing: " + ", ".join(missing))
 
-    return find_column(
-        df.columns,
-        patterns,
-    )
-
-
-def find_date_column(df):
-    patterns = [
-        r"\bdata\b",
-        r"^date$",
-        r"^dataestrazione$",
-        r"^datadellestrazione$",
-    ]
-
-    return find_column(
-        df.columns,
-        patterns,
-    )
-
-
-# ============================================================
-# PARSING E NORMALIZZAZIONE
-# ============================================================
-
-def parse_csv_data(csv_text):
-    log("Parsing e normalizzazione CSV...")
-
-    raw_df = read_raw_csv(csv_text)
-
-    log(
-        "CSV interpretato: "
-        f"{len(raw_df)} righe, "
-        f"{len(raw_df.columns)} colonne."
-    )
-
-    log(
-        "Colonne originali: "
-        + ", ".join(str(c) for c in raw_df.columns)
-    )
-
-    contest_col = find_contest_column(raw_df)
-    date_col = find_date_column(raw_df)
-
-    if contest_col is None:
-        raise ValueError(
-            "Colonna concorso non identificata."
-        )
-
-    if date_col is None:
-        raise ValueError(
-            "Colonna data non identificata."
-        )
-
-    number_cols = find_number_columns(raw_df)
-
-    log(
-        f"Colonna concorso: {contest_col}"
-    )
-    log(
-        f"Colonna data: {date_col}"
-    )
-    log(
-        "Colonne numeri principali: "
-        + ", ".join(str(c) for c in number_cols)
-    )
-
-    parsed_rows = []
-
-    for _, row in raw_df.iterrows():
-        contest = parse_contest_value(
-            row[contest_col]
-        )
-
-        date_value = parse_date_value(
-            row[date_col]
-        )
-
-        if contest is None or pd.isna(date_value):
-            continue
-
-        numbers = [
-            parse_integer(row[col])
-            for col in number_cols
-        ]
-
-        if any(
-            value is None
-            for value in numbers
-        ):
-            continue
-
-        if len(numbers) != NUMBERS_PER_DRAW:
-            continue
-
-        if any(
-            value < VALID_NUMBERS_MIN
-            or value > VALID_NUMBERS_MAX
-            for value in numbers
-        ):
-            continue
-
-        if len(set(numbers)) != NUMBERS_PER_DRAW:
-            continue
-
-        parsed_rows.append(
-            {
-                "data": date_value,
-                "concorso": int(contest),
-                "n1": int(numbers[0]),
-                "n2": int(numbers[1]),
-                "n3": int(numbers[2]),
-                "n4": int(numbers[3]),
-                "n5": int(numbers[4]),
-                "n6": int(numbers[5]),
-            }
-        )
-
-    if not parsed_rows:
-        raise ValueError(
-            "Il parser non ha prodotto alcuna "
-            "estrazione valida."
-        )
-
-    parsed_df = pd.DataFrame(
-        parsed_rows,
-        columns=[
-            "data",
-            "concorso",
-            "n1",
-            "n2",
-            "n3",
-            "n4",
-            "n5",
-            "n6",
-        ],
-    )
-
-    parsed_df["data"] = pd.to_datetime(
-        parsed_df["data"],
-        errors="coerce",
-    )
-
-    parsed_df["year"] = (
-        parsed_df["data"].dt.year.astype("Int64")
-    )
-
-    parsed_df = parsed_df[
-        parsed_df["year"].between(
-            REQUIRED_START_YEAR,
-            CURRENT_YEAR,
-        )
-    ].copy()
-
-    parsed_df["year"] = (
-        parsed_df["year"].astype(int)
-    )
-
-    parsed_df = parsed_df.sort_values(
-        ["concorso", "data"]
-    ).reset_index(drop=True)
-
-    log(
-        f"Righe valide dopo normalizzazione: "
-        f"{len(parsed_df)}"
-    )
-
-    return parsed_df
+    df = df.copy()
+    df["data"] = pd.to_datetime(df["data"], errors="coerce")
+    for col in ["year", "concorso", "n1", "n2", "n3", "n4", "n5", "n6"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=required).copy()
+    for col in ["year", "concorso", "n1", "n2", "n3", "n4", "n5", "n6"]:
+        df[col] = df[col].astype(int)
+    df = df[df["year"].between(REQUIRED_START_YEAR, CURRENT_YEAR)].copy()
+    return df.sort_values(["year", "data", "concorso"]).reset_index(drop=True)
 
 
 # ============================================================
@@ -816,81 +489,21 @@ def parse_csv_data(csv_text):
 # ============================================================
 
 def resolve_duplicates_strict(df):
-    log(
-        "Verifica unicità della chiave "
-        "(anno, concorso)..."
-    )
-
+    key = ["year", "concorso"]
+    full = ["year", "concorso", "data", "n1", "n2", "n3", "n4", "n5", "n6"]
     initial_len = len(df)
+    exact = df.drop_duplicates(subset=full).copy()
+    removed_exact = initial_len - len(exact)
+    if removed_exact:
+        log(f"Rimosse {removed_exact} duplicazioni perfettamente identiche.")
 
-    # Duplicati perfettamente identici:
-    # sono innocui e vengono eliminati.
-    df_dedup = df.drop_duplicates(
-        subset=[
-            "year",
-            "concorso",
-            "data",
-            "n1",
-            "n2",
-            "n3",
-            "n4",
-            "n5",
-            "n6",
-        ]
-    ).copy()
-
-    removed_exact = (
-        initial_len - len(df_dedup)
-    )
-
-    if removed_exact > 0:
-        log(
-            f"Rimosse {removed_exact} righe "
-            "duplicate identiche."
-        )
-
-    conflicts = df_dedup[
-        df_dedup.duplicated(
-            subset=["year", "concorso"],
-            keep=False,
-        )
-    ].copy()
-
+    conflicts = exact[exact.duplicated(subset=key, keep=False)].copy()
     if not conflicts.empty:
-        log(
-            "ERRORE FATALE: conflitto di dati "
-            "sullo stesso anno e concorso:"
-        )
+        log("ERRORE FATALE: conflitto sullo stesso (anno, concorso):")
+        log(conflicts[full].to_string(index=False))
+        return None, f"Conflitto dati irreconciliabile su {len(conflicts)} righe."
 
-        log(
-            conflicts[
-                [
-                    "year",
-                    "concorso",
-                    "data",
-                    "n1",
-                    "n2",
-                    "n3",
-                    "n4",
-                    "n5",
-                    "n6",
-                ]
-            ].to_string(index=False)
-        )
-
-        return None, (
-            "Conflitto dati irreconciliabile "
-            f"su {len(conflicts)} righe."
-        )
-
-    return (
-        df_dedup
-        .sort_values(
-            ["concorso", "data"]
-        )
-        .reset_index(drop=True),
-        None,
-    )
+    return exact.sort_values(["year", "data", "concorso"]).reset_index(drop=True), None
 
 
 # ============================================================
@@ -898,131 +511,43 @@ def resolve_duplicates_strict(df):
 # ============================================================
 
 def audit_structure(df):
-    errors = []
-    warnings = []
-
-    required_columns = [
-        "data",
-        "concorso",
-        "n1",
-        "n2",
-        "n3",
-        "n4",
-        "n5",
-        "n6",
-        "year",
-    ]
-
-    missing = [
-        col
-        for col in required_columns
-        if col not in df.columns
-    ]
-
+    errors, warnings = [], []
+    required = ["data", "year", "concorso", "n1", "n2", "n3", "n4", "n5", "n6"]
+    missing = [c for c in required if c not in df.columns]
     if missing:
-        errors.append(
-            "Colonne mancanti: "
-            + ", ".join(missing)
-        )
+        errors.append("Colonne mancanti: " + ", ".join(missing))
         return errors, warnings
-
     if df.empty:
-        errors.append(
-            "Dataset vuoto."
-        )
+        errors.append("Dataset vuoto.")
         return errors, warnings
-
     if len(df) < MIN_TOTAL_RECORDS:
-        errors.append(
-            "Numero totale di estrazioni insufficiente: "
-            f"{len(df)} < {MIN_TOTAL_RECORDS}."
-        )
-
-    if df["concorso"].isna().any():
-        errors.append(
-            "Presenti concorsi nulli."
-        )
-
-    if (
-        df["concorso"] <= 0
-    ).any():
-        errors.append(
-            "Presenti numeri di concorso <= 0."
-        )
-
+        errors.append(f"Numero totale di estrazioni insufficiente: {len(df)} < {MIN_TOTAL_RECORDS}.")
+    if df["concorso"].le(0).any():
+        errors.append("Presenti numeri di concorso <= 0.")
     if df["data"].isna().any():
-        errors.append(
-            "Presenti date non valide."
-        )
+        errors.append("Presenti date non valide.")
+    if (~df["year"].between(REQUIRED_START_YEAR, CURRENT_YEAR)).any():
+        errors.append(f"Presenti anni fuori dall'intervallo {REQUIRED_START_YEAR}-{CURRENT_YEAR}.")
 
-    if (
-        df["year"] < REQUIRED_START_YEAR
-    ).any():
-        errors.append(
-            "Presenti record antecedenti al "
-            f"{REQUIRED_START_YEAR}."
-        )
-
-    if (
-        df["year"] > CURRENT_YEAR
-    ).any():
-        errors.append(
-            "Presenti record successivi "
-            "all'anno corrente."
-        )
-
-    # Controllo dei sei numeri.
-    for col in [
-        "n1",
-        "n2",
-        "n3",
-        "n4",
-        "n5",
-        "n6",
-    ]:
-        invalid = (
-            ~df[col].between(
-                VALID_NUMBERS_MIN,
-                VALID_NUMBERS_MAX,
-            )
-        )
-
+    for col in ["n1", "n2", "n3", "n4", "n5", "n6"]:
+        invalid = ~df[col].between(1, 90)
         if invalid.any():
-            errors.append(
-                f"Valori fuori range 1..90 "
-                f"nella colonna {col}: "
-                f"{int(invalid.sum())}."
-            )
+            errors.append(f"Valori fuori range 1..90 in {col}: {int(invalid.sum())}.")
 
-    # Nessun doppione nella stessa estrazione.
     duplicate_numbers = []
-
     for index, row in df.iterrows():
-        numbers = [
-            int(row[f"n{i}"])
-            for i in range(1, 7)
-        ]
-
-        if len(set(numbers)) != 6:
+        values = [int(row[f"n{i}"]) for i in range(1, 7)]
+        if len(set(values)) != 6:
             duplicate_numbers.append(index)
-
     if duplicate_numbers:
-        errors.append(
-            "Presenti estrazioni con numeri "
-            "duplicati internamente: "
-            f"{len(duplicate_numbers)}."
-        )
+        errors.append(f"Estrazioni con numeri principali duplicati: {len(duplicate_numbers)}.")
 
-    # Controllo coerenza anno/data.
-    date_year_mismatch = (
-        df["data"].dt.year != df["year"]
-    )
+    mismatch = df["data"].dt.year != df["year"]
+    if mismatch.any():
+        errors.append(f"Incoerenza tra anno e data: {int(mismatch.sum())} record.")
 
-    if date_year_mismatch.any():
-        errors.append(
-            "Incoerenza tra colonna year e data: "
-            f"{int(date_year_mismatch.sum())}."
-        )
+    if df.duplicated(subset=["year", "concorso"], keep=False).any():
+        errors.append("Chiave (anno, concorso) non univoca.")
 
     return errors, warnings
 
@@ -1032,185 +557,66 @@ def audit_structure(df):
 # ============================================================
 
 def audit_coverage(df):
-    errors = []
-    warnings = []
-
-    years_present = set(
-        int(year)
-        for year in df["year"].unique()
-    )
-
-    expected_years = set(
-        range(
-            REQUIRED_START_YEAR,
-            CURRENT_YEAR + 1,
-        )
-    )
-
-    missing_years = sorted(
-        expected_years - years_present
-    )
-
+    errors, warnings = [], []
+    years_present = set(int(v) for v in df["year"].unique())
+    expected_years = set(range(REQUIRED_START_YEAR, CURRENT_YEAR + 1))
+    missing_years = sorted(expected_years - years_present)
     if missing_years:
-        errors.append(
-            "Anni completamente mancanti "
-            "nell'archivio: "
-            + ", ".join(
-                str(year)
-                for year in missing_years
-            )
-        )
+        errors.append("Anni completamente mancanti: " + ", ".join(map(str, missing_years)))
 
-    yearly_counts = (
-        df.groupby("year")
-        .size()
-        .to_dict()
-    )
-
-    # Gli anni storici completi devono avere almeno
-    # 80 estrazioni. L'anno corrente è escluso da questo
-    # requisito perché è ancora in corso.
-    for year in range(
-        REQUIRED_START_YEAR,
-        CURRENT_YEAR,
-    ):
-        count = int(
-            yearly_counts.get(year, 0)
-        )
-
+    yearly_counts = df.groupby("year").size().to_dict()
+    for year in range(REQUIRED_START_YEAR, CURRENT_YEAR):
+        count = int(yearly_counts.get(year, 0))
         if count < MIN_HISTORICAL_DRAWS_PER_YEAR:
             errors.append(
-                f"Anno {year}: solo {count} "
-                "estrazioni; minimo richiesto "
-                f"{MIN_HISTORICAL_DRAWS_PER_YEAR}."
+                f"Anno {year}: solo {count} estrazioni; minimo richiesto {MIN_HISTORICAL_DRAWS_PER_YEAR}."
             )
 
-    current_count = int(
-        yearly_counts.get(CURRENT_YEAR, 0)
-    )
-
+    current_count = int(yearly_counts.get(CURRENT_YEAR, 0))
     if current_count <= 0:
-        errors.append(
-            f"Nessuna estrazione presente "
-            f"per l'anno corrente {CURRENT_YEAR}."
-        )
+        errors.append(f"Nessuna estrazione presente per l'anno corrente {CURRENT_YEAR}.")
 
-    # Verifica che le finestre sperimentali siano
-    # realmente coperte.
     windows = [
-        (
-            "training",
-            TRAINING_START_YEAR,
-            TRAINING_END_YEAR,
-        ),
-        (
-            "discovery",
-            DISCOVERY_START_YEAR,
-            DISCOVERY_END_YEAR,
-        ),
-        (
-            "confirmation",
-            CONFIRMATION_START_YEAR,
-            CURRENT_YEAR,
-        ),
+        ("training", TRAINING_START_YEAR, TRAINING_END_YEAR),
+        ("discovery", DISCOVERY_START_YEAR, DISCOVERY_END_YEAR),
+        ("confirmation", CONFIRMATION_START_YEAR, CURRENT_YEAR),
     ]
-
     for name, start, end in windows:
-        window_df = df[
-            df["year"].between(start, end)
-        ]
+        if df[df["year"].between(start, end)].empty:
+            errors.append(f"Finestra {name} completamente vuota.")
 
-        if window_df.empty:
-            errors.append(
-                f"Finestra {name} completamente vuota."
-            )
-
-    # Controllo della sequenza dei concorsi.
-    contests = (
-        df["concorso"]
-        .dropna()
-        .astype(int)
-        .sort_values()
-        .tolist()
-    )
-
-    if contests:
+    # Contest numbering is annual on this archive. Check gaps within each year only.
+    for year, group in df.groupby("year"):
+        contests = sorted(group["concorso"].astype(int).tolist())
         gaps = []
-
-        previous = contests[0]
-
-        for current in contests[1:]:
+        for previous, current in zip(contests, contests[1:]):
             if current > previous + 1:
-                gaps.append(
-                    (
-                        previous,
-                        current,
-                        current - previous - 1,
-                    )
-                )
-
-            previous = current
-
+                gaps.append((previous, current, current - previous - 1))
         if gaps:
-            preview = gaps[:20]
-
             warnings.append(
-                "Rilevati buchi nella sequenza dei "
-                "numeri di concorso. Prime occorrenze: "
-                + "; ".join(
-                    f"{a}->{b} "
-                    f"(mancano {missing})"
-                    for a, b, missing in preview
-                )
+                f"Anno {int(year)}: buchi nella sequenza dei concorsi: "
+                + "; ".join(f"{a}->{b} (mancano {n})" for a, b, n in gaps[:10])
             )
-
-    # Controllo date monotone rispetto al concorso.
-    ordered = df.sort_values(
-        "concorso"
-    )
-
-    if not ordered["data"].is_monotonic_increasing:
-        warnings.append(
-            "La data non è perfettamente monotona "
-            "rispetto al numero di concorso."
-        )
+        if not group.sort_values("concorso")["data"].is_monotonic_increasing:
+            errors.append(
+                f"Anno {int(year)}: data non monotona rispetto al numero di concorso."
+            )
 
     return errors, warnings
 
 
 # ============================================================
-# AUDIT DUPLICATI GLOBALI
+# AUDIT CROSS-YEAR
 # ============================================================
 
 def audit_global_contest_consistency(df):
-    errors = []
-    warnings = []
-
-    grouped = df.groupby(
-        "concorso",
-        dropna=False,
-    )
-
-    cross_year_conflicts = []
-
-    for contest, group in grouped:
-        years = group["year"].unique()
-
-        if len(years) > 1:
-            cross_year_conflicts.append(
-                int(contest)
-            )
-
-    if cross_year_conflicts:
-        errors.append(
-            "Lo stesso numero di concorso compare "
-            "in anni differenti: "
-            + ", ".join(
-                str(x)
-                for x in cross_year_conflicts[:50]
-            )
+    errors, warnings = [], []
+    repeated = df.groupby("concorso")["year"].nunique()
+    if (repeated > 1).any():
+        warnings.append(
+            "Numeri di concorso ricorrenti in anni diversi: "
+            "comportamento atteso perché la numerazione è annuale."
         )
-
     return errors, warnings
 
 
