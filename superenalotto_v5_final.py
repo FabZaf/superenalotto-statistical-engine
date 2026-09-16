@@ -1,5 +1,5 @@
 # ============================================================
-# SUPERNALOTTO PIPELINE V5.2.5 — STRICT DATA INTEGRITY AUDIT
+# SUPERNALOTTO PIPELINE V5.2.6 — STRICT DATA INTEGRITY AUDIT
 # ENGINE DISABLED
 #
 # Scopo:
@@ -69,7 +69,7 @@ SESSION.headers.update(
     {
         "User-Agent": (
             "Mozilla/5.0 (compatible; "
-            "SuperEnalotto-Statistical-Audit/5.2.5)"
+            "SuperEnalotto-Statistical-Audit/5.2.6)"
         )
     }
 )
@@ -384,7 +384,16 @@ NUMBER_RE = re.compile(r"(?<!\d)(\d{1,2})(?!\d)")
 
 
 def parse_annual_page(html, year):
-    """Parse one explicit annual SuperEnalotto archive page."""
+    """
+    Parse one explicit annual SuperEnalotto archive page.
+
+    The archive page exposes each draw as a block beginning with
+    "Concorso n. <N> <date>" followed immediately by the six main
+    numbers and then Jolly.  We deliberately take ONLY the first six
+    numeric tokens after the date.  We do not scrape every number in
+    the block, because Jolly, SuperStar and page metadata are separate
+    fields and must never enter n1..n6.
+    """
     lines = html_to_text_lines(html)
     if not lines:
         raise RuntimeError(f"Anno {year}: nessun testo visibile estratto.")
@@ -399,50 +408,79 @@ def parse_annual_page(html, year):
         raise RuntimeError(f"Anno {year}: nessun 'Concorso n.' riconosciuto.")
 
     records = []
+
     for pos, (start, contest) in enumerate(positions):
         end = positions[pos + 1][0] if pos + 1 < len(positions) else len(lines)
-        block = " ".join(lines[start:end])
+        block_lines = lines[start:end]
+        block = " ".join(block_lines)
 
         date_match = DATE_RE.search(block)
         if not date_match:
             log(f"WARNING: anno {year}, concorso {contest}: data non riconosciuta.")
             continue
 
-        date_value = pd.to_datetime(date_match.group(1), dayfirst=True, errors="coerce")
+        date_value = pd.to_datetime(
+            date_match.group(1),
+            dayfirst=True,
+            errors="coerce",
+        )
         if pd.isna(date_value) or date_value.year != year:
             log(f"WARNING: anno {year}, concorso {contest}: data non valida.")
             continue
 
+        # From this point onward, the first six numeric tokens are the
+        # six SuperEnalotto main numbers. Jolly is deliberately ignored.
         main_text = block[date_match.end():]
-        jolly_match = re.search(r"\bJolly\b", main_text, re.IGNORECASE)
-        if jolly_match:
-            main_text = main_text[:jolly_match.start()]
+        numbers = [int(x) for x in NUMBER_RE.findall(main_text)][:NUMBERS_PER_DRAW]
 
-        numbers = [int(x) for x in NUMBER_RE.findall(main_text)]
-        if len(numbers) != 6:
-            log(f"WARNING: anno {year}, concorso {contest}: trovati {len(numbers)} numeri principali; record scartato.")
-            continue
-        if any(x < 1 or x > 90 for x in numbers) or len(set(numbers)) != 6:
-            log(f"WARNING: anno {year}, concorso {contest}: combinazione non valida; record scartato.")
+        if len(numbers) != NUMBERS_PER_DRAW:
+            log(
+                f"WARNING: anno {year}, concorso {contest}: "
+                f"trovati meno di {NUMBERS_PER_DRAW} numeri principali."
+            )
             continue
 
-        records.append({
-            "data": pd.Timestamp(date_value).normalize(),
-            "year": int(year),
-            "concorso": int(contest),
-            "n1": numbers[0], "n2": numbers[1], "n3": numbers[2],
-            "n4": numbers[3], "n5": numbers[4], "n6": numbers[5],
-        })
+        if any(x < VALID_NUMBERS_MIN or x > VALID_NUMBERS_MAX for x in numbers):
+            log(
+                f"WARNING: anno {year}, concorso {contest}: "
+                "numero principale fuori range 1..90; record scartato."
+            )
+            continue
+
+        if len(set(numbers)) != NUMBERS_PER_DRAW:
+            log(
+                f"WARNING: anno {year}, concorso {contest}: "
+                "numeri principali duplicati; record scartato."
+            )
+            continue
+
+        records.append(
+            {
+                "data": pd.Timestamp(date_value).normalize(),
+                "year": int(year),
+                "concorso": int(contest),
+                "n1": numbers[0],
+                "n2": numbers[1],
+                "n3": numbers[2],
+                "n4": numbers[3],
+                "n5": numbers[4],
+                "n6": numbers[5],
+            }
+        )
 
     if not records:
-        raise RuntimeError(f"Anno {year}: nessuna estrazione valida prodotta dal parser.")
+        raise RuntimeError(
+            f"Anno {year}: nessuna estrazione valida prodotta dal parser."
+        )
 
     df = pd.DataFrame(records)
     dup = df.duplicated(subset=["year", "concorso"], keep=False)
     if dup.any():
         conflict = df.loc[dup].drop_duplicates()
         if len(conflict) > 1:
-            raise RuntimeError(f"Anno {year}: conflitto interno sul medesimo numero di concorso.")
+            raise RuntimeError(
+                f"Anno {year}: conflitto interno sul medesimo numero di concorso."
+            )
         df = df.drop_duplicates(subset=["year", "concorso"])
 
     return df.sort_values(["data", "concorso"]).reset_index(drop=True)
@@ -565,8 +603,19 @@ def audit_coverage(df):
         errors.append("Anni completamente mancanti: " + ", ".join(map(str, missing_years)))
 
     yearly_counts = df.groupby("year").size().to_dict()
+
+    # Il 1997 è il primo anno di attività e contiene solo le 9
+    # estrazioni ufficiali dal 03/12/1997 al 31/12/1997. Non è quindi
+    # un anno storico completo e non può essere sottoposto al minimo
+    # di 80 estrazioni previsto per gli anni completi.
     for year in range(REQUIRED_START_YEAR, CURRENT_YEAR):
         count = int(yearly_counts.get(year, 0))
+        if year == REQUIRED_START_YEAR:
+            if count <= 0:
+                errors.append(
+                    f"Anno {year}: nessuna estrazione ufficiale presente."
+                )
+            continue
         if count < MIN_HISTORICAL_DRAWS_PER_YEAR:
             errors.append(
                 f"Anno {year}: solo {count} estrazioni; minimo richiesto {MIN_HISTORICAL_DRAWS_PER_YEAR}."
@@ -672,7 +721,7 @@ def run_strict_data_audit():
     log("")
     log("=======================================================")
     log(
-        "SUPERNALOTTO PIPELINE V5.2.5 "
+        "SUPERNALOTTO PIPELINE V5.2.6 "
         "— STRICT DATA INTEGRITY AUDIT"
     )
     log("ENGINE DISABLED")
