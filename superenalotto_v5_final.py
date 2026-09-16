@@ -720,14 +720,19 @@ def run_strict_data_audit():
 
         raise
 
-    # Download.
+    # Acquisizione: pagine annuali esplicite.
+    # L'anno viene determinato dalla pagina annuale richiesta,
+    # evitando di ricostruirlo dal CSV globale.
     try:
-        csv_text = download_bootstrap()
+        df, source_years = download_and_build_archive()
+        log(
+            f"Acquisizione completata: {len(source_years)} anni richiesti, "
+            f"{len(df)} record grezzi prodotti."
+        )
     except Exception as exc:
         errors.append(
-            f"Download bootstrap fallito: {exc}"
+            f"Acquisizione/parsing archivio annuale fallita: {exc}"
         )
-
         write_report(
             "FAILED",
             0,
@@ -735,17 +740,15 @@ def run_strict_data_audit():
             warnings,
             None,
         )
-
         raise
 
-    # Parsing.
+    # Normalizzazione finale dei tipi e dell'intervallo temporale.
     try:
-        df = parse_csv_data(csv_text)
+        df = normalize_archive(df)
     except Exception as exc:
         errors.append(
-            f"Parsing/normalizzazione fallita: {exc}"
+            f"Normalizzazione finale fallita: {exc}"
         )
-
         write_report(
             "FAILED",
             0,
@@ -753,7 +756,6 @@ def run_strict_data_audit():
             warnings,
             None,
         )
-
         raise
 
     # Duplicati.
