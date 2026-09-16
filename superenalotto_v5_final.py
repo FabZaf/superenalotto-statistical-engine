@@ -3,26 +3,21 @@
 
 """
 SUPERNALOTTO STATISTICAL ENGINE
-V5.4 — STRICT HISTORICAL DATA BUILDER
+V5.5
+STRICT HISTORICAL DATA ACQUISITION + INTEGRITY AUDIT
 
-FASE ATTUALE
-------------
-Solo acquisizione + verifica integrità dello storico.
+FASE ATTUALE:
+- acquisizione storico
+- validazione dati
+- export CSV
+- report JSON
 
-Il motore statistico è DISABILITATO.
+ENGINE STATISTICO:
+DISABILITATO
 
-NON:
-- predice numeri
-- genera giocate
-- seleziona numeri futuri
-- interpreta anomalie come previsioni
-
-OBIETTIVO
----------
-Costruire uno storico verificato 1997 -> anno corrente.
-
-Fonte:
-https://www.estrazioni.it/superenalotto/?anno=YYYY
+Nessuna previsione.
+Nessuna generazione di combinazioni.
+Nessun test statistico in questa fase.
 """
 
 from __future__ import annotations
@@ -41,12 +36,14 @@ import requests
 
 
 # ============================================================================
-# CONFIG
+# CONFIGURAZIONE
 # ============================================================================
 
-VERSION = "V5.4"
+VERSION = "V5.5"
 
-SOURCE_URL = "https://www.estrazioni.it/superenalotto/?anno={year}"
+SOURCE_URL = (
+    "https://www.estrazioni.it/superenalotto/?anno={year}"
+)
 
 START_YEAR = 1997
 END_YEAR = datetime.now().year
@@ -70,16 +67,28 @@ MAX_NUMBER = 90
 # ============================================================================
 
 def log(message: str) -> None:
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{now}] {message}", flush=True)
+    stamp = datetime.now().strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+    print(
+        f"[{stamp}] {message}",
+        flush=True,
+    )
 
 
 # ============================================================================
-# TEXT NORMALIZATION
+# NORMALIZZAZIONE
 # ============================================================================
 
 def normalize_unicode(text: str) -> str:
-    text = unicodedata.normalize("NFKC", text)
+    """
+    Normalizza Unicode senza alterare il contenuto numerico.
+    """
+
+    text = unicodedata.normalize(
+        "NFKC",
+        text,
+    )
 
     replacements = {
         "\xa0": " ",
@@ -94,35 +103,45 @@ def normalize_unicode(text: str) -> str:
     }
 
     for old, new in replacements.items():
-        text = text.replace(old, new)
+        text = text.replace(
+            old,
+            new,
+        )
 
     return text
 
 
-def clean_line(text: str) -> str:
+def normalize_text(text: str) -> str:
+    """
+    Trasforma l'intero documento in una sequenza testuale
+    uniforme.
+
+    Questo evita di dipendere dalla struttura dei tag HTML.
+    """
+
     text = normalize_unicode(text)
-    text = re.sub(r"\s+", " ", text)
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        text,
+    )
+
     return text.strip()
 
 
 # ============================================================================
-# HTML PARSER
+# HTML -> TESTO
 # ============================================================================
 
-class VisibleLineParser(HTMLParser):
+class FlatTextParser(HTMLParser):
     """
-    Estrae il testo visibile mantenendo la separazione logica delle righe.
+    Converte l'HTML in testo piatto.
 
-    Questo è fondamentale perché la struttura reale dell'archivio è:
+    A differenza delle versioni precedenti NON tenta di ricostruire
+    la struttura delle righe HTML.
 
-        intestazione estrazione
-        6 numeri principali
-        Jolly / SuperStar
-        intestazione estrazione
-        6 numeri principali
-        ...
-
-    Non cerchiamo quindi più numeri in un blocco HTML generico.
+    Ogni blocco testuale viene separato da uno spazio.
     """
 
     SKIP_TAGS = {
@@ -133,74 +152,58 @@ class VisibleLineParser(HTMLParser):
         "template",
     }
 
-    BLOCK_TAGS = {
-        "br",
-        "p",
-        "div",
-        "li",
-        "tr",
-        "section",
-        "article",
-        "header",
-        "footer",
-        "h1",
-        "h2",
-        "h3",
-        "h4",
-        "h5",
-        "h6",
-    }
-
     def __init__(self) -> None:
-        super().__init__(convert_charrefs=True)
+        super().__init__(
+            convert_charrefs=True
+        )
+
         self.parts: list[str] = []
         self.skip_depth = 0
 
-    def handle_starttag(self, tag, attrs):
+    def handle_starttag(
+        self,
+        tag,
+        attrs,
+    ):
         tag = tag.lower()
 
         if tag in self.SKIP_TAGS:
             self.skip_depth += 1
-            return
 
-        if tag in self.BLOCK_TAGS:
-            self.parts.append("\n")
-
-    def handle_endtag(self, tag):
+    def handle_endtag(
+        self,
+        tag,
+    ):
         tag = tag.lower()
 
         if tag in self.SKIP_TAGS:
             if self.skip_depth > 0:
                 self.skip_depth -= 1
-            return
 
-        if tag in self.BLOCK_TAGS:
-            self.parts.append("\n")
+    def handle_data(
+        self,
+        data,
+    ):
+        if self.skip_depth == 0:
+            if data and data.strip():
+                self.parts.append(data)
 
-    def handle_data(self, data):
-        if self.skip_depth == 0 and data:
-            self.parts.append(data)
-
-    def get_lines(self) -> list[str]:
-        raw = "".join(self.parts)
-        raw = normalize_unicode(raw)
-
-        lines = []
-
-        for raw_line in raw.splitlines():
-            line = clean_line(raw_line)
-
-            if line:
-                lines.append(line)
-
-        return lines
+    def get_text(self) -> str:
+        return normalize_text(
+            " ".join(self.parts)
+        )
 
 
-def html_to_lines(html: str) -> list[str]:
-    parser = VisibleLineParser()
+def html_to_text(
+    html: str,
+) -> str:
+
+    parser = FlatTextParser()
+
     parser.feed(html)
     parser.close()
-    return parser.get_lines()
+
+    return parser.get_text()
 
 
 # ============================================================================
@@ -216,17 +219,30 @@ SESSION.headers.update({
         "(KHTML, like Gecko) "
         "Chrome/131.0 Safari/537.36"
     ),
-    "Accept": "text/html,application/xhtml+xml",
-    "Accept-Language": "it-IT,it;q=0.9,en;q=0.8",
+    "Accept": (
+        "text/html,application/xhtml+xml,"
+        "application/xml;q=0.9,*/*;q=0.8"
+    ),
+    "Accept-Language": (
+        "it-IT,it;q=0.9,en;q=0.8"
+    ),
 })
 
 
-def fetch_year(year: int) -> str:
-    url = SOURCE_URL.format(year=year)
+def fetch_year(
+    year: int,
+) -> str:
+
+    url = SOURCE_URL.format(
+        year=year
+    )
 
     last_error = None
 
-    for attempt in range(1, MAX_RETRIES + 1):
+    for attempt in range(
+        1,
+        MAX_RETRIES + 1,
+    ):
 
         log(
             f"WEB FETCH {year} "
@@ -234,6 +250,7 @@ def fetch_year(year: int) -> str:
         )
 
         try:
+
             response = SESSION.get(
                 url,
                 timeout=REQUEST_TIMEOUT,
@@ -242,8 +259,10 @@ def fetch_year(year: int) -> str:
             response.raise_for_status()
 
             if len(response.text) < 1000:
+
                 raise RuntimeError(
-                    f"HTML troppo corto: {len(response.text)} byte"
+                    "HTML ricevuto troppo corto: "
+                    f"{len(response.text)} byte"
                 )
 
             return response.text
@@ -253,14 +272,17 @@ def fetch_year(year: int) -> str:
             last_error = exc
 
             log(
-                f"WARNING: fetch {year} fallito: {exc}"
+                f"WARNING: fetch {year} fallito: "
+                f"{exc}"
             )
 
             if attempt < MAX_RETRIES:
-                time.sleep(RETRY_SLEEP)
+                time.sleep(
+                    RETRY_SLEEP
+                )
 
     raise RuntimeError(
-        f"Impossibile scaricare l'anno {year}: "
+        f"Impossibile scaricare {year}: "
         f"{last_error}"
     )
 
@@ -270,126 +292,184 @@ def fetch_year(year: int) -> str:
 # ============================================================================
 
 DECLARED_COUNT_RE = re.compile(
-    r"(\d+)\s+estrazioni\s+nel\s+(\d{4})",
+    r"\b(\d+)\s+estrazioni\s+nel\s+(\d{4})\b",
     re.IGNORECASE,
 )
 
-HISTORICAL_HEADER_RE = re.compile(
-    r"^Concorso\s+n\.?\s*(\d+)\s+"
-    r"(\d{1,2}/\d{1,2}/\d{4})$",
-    re.IGNORECASE,
+# Formato storico:
+#
+# Concorso n. 95 31/12/1997
+# 34 36 71 76 86 89
+#
+# Dopo la normalizzazione HTML non importa più
+# quanti tag siano presenti tra i singoli elementi.
+HISTORICAL_RE = re.compile(
+    r"""
+    Concorso
+    \s+
+    n
+    \.?
+    \s*
+    (\d+)
+    \s+
+    (\d{1,2}/\d{1,2}/\d{4})
+    \s+
+    (
+        (?:\d{1,2}\s+){5}
+        \d{1,2}
+    )
+    """,
+    re.IGNORECASE | re.VERBOSE,
 )
 
-MODERN_HEADER_RE = re.compile(
-    r"^SuperEnalotto\s+"
-    r"(\d{1,2}/\d{1,2}/\d{4})$",
-    re.IGNORECASE,
-)
-
-NUMBER_ONLY_RE = re.compile(
-    r"^\s*(\d{1,2})"
-    r"(?:\s+(\d{1,2}))"
-    r"(?:\s+(\d{1,2}))"
-    r"(?:\s+(\d{1,2}))"
-    r"(?:\s+(\d{1,2}))"
-    r"(?:\s+(\d{1,2}))\s*$"
+# Formato moderno:
+#
+# SuperEnalotto 31/12/2016
+# 12 14 18 22 28 33
+#
+MODERN_RE = re.compile(
+    r"""
+    SuperEnalotto
+    \s+
+    (\d{1,2}/\d{1,2}/\d{4})
+    \s+
+    (
+        (?:\d{1,2}\s+){5}
+        \d{1,2}
+    )
+    """,
+    re.IGNORECASE | re.VERBOSE,
 )
 
 
 # ============================================================================
-# VALIDATION
+# VALIDAZIONE DATA
 # ============================================================================
 
 def validate_date(
     date_text: str,
-    year: int,
+    expected_year: int,
 ) -> str:
 
     try:
+
         dt = datetime.strptime(
             date_text,
             "%d/%m/%Y",
         )
+
     except ValueError as exc:
+
         raise RuntimeError(
             f"Data non valida: {date_text}"
         ) from exc
 
-    if dt.year != year:
+    if dt.year != expected_year:
+
         raise RuntimeError(
-            f"Data {date_text} incompatibile con anno {year}"
+            f"Data {date_text} "
+            f"non appartiene all'anno "
+            f"{expected_year}."
         )
 
-    return dt.strftime("%Y-%m-%d")
+    return dt.strftime(
+        "%Y-%m-%d"
+    )
 
 
-def parse_six_numbers(
-    line: str,
+# ============================================================================
+# VALIDAZIONE NUMERI
+# ============================================================================
+
+def parse_numbers(
+    numbers_text: str,
     year: int,
     contest: int | None,
     date_text: str,
 ) -> tuple[int, ...]:
 
-    match = NUMBER_ONLY_RE.fullmatch(line)
+    tokens = re.findall(
+        r"(?<!\d)\d{1,2}(?!\d)",
+        numbers_text,
+    )
 
-    if not match:
+    if len(tokens) != MAIN_NUMBERS:
+
         raise RuntimeError(
-            "La riga successiva all'intestazione "
-            "non contiene esattamente 6 numeri principali: "
-            f"'{line}'"
+            f"Attesi 6 numeri principali, "
+            f"trovati {len(tokens)}: "
+            f"{numbers_text!r}"
         )
 
     numbers = tuple(
         int(x)
-        for x in match.groups()
+        for x in tokens
     )
 
-    if len(numbers) != 6:
-        raise RuntimeError(
-            f"Numero numeri principali inatteso: {numbers}"
-        )
-
     if any(
-        n < MIN_NUMBER or n > MAX_NUMBER
+        n < MIN_NUMBER or
+        n > MAX_NUMBER
         for n in numbers
     ):
+
         raise RuntimeError(
-            f"Numero fuori intervallo 1-90: {numbers}"
+            f"Numero fuori intervallo 1-90: "
+            f"{numbers}"
         )
 
-    if len(set(numbers)) != 6:
+    if len(set(numbers)) != MAIN_NUMBERS:
+
         raise RuntimeError(
-            f"Numeri principali duplicati: {numbers}"
+            f"Numeri principali duplicati: "
+            f"{numbers}"
         )
 
     return numbers
 
 
 # ============================================================================
-# DECLARED COUNT
+# CONTEGGIO DICHIARATO
 # ============================================================================
 
 def get_declared_count(
-    lines: list[str],
+    text: str,
     year: int,
 ) -> int:
 
-    pattern = re.compile(
-        rf"(\d+)\s+estrazioni\s+nel\s+{year}\b",
-        re.IGNORECASE,
+    matches = list(
+        DECLARED_COUNT_RE.finditer(
+            text
+        )
     )
 
-    for line in lines:
+    matches = [
+        m
+        for m in matches
+        if int(m.group(2)) == year
+    ]
 
-        match = pattern.search(line)
+    if not matches:
 
-        if match:
-            return int(match.group(1))
+        raise RuntimeError(
+            f"Anno {year}: conteggio "
+            f"'X estrazioni nel {year}' "
+            f"non trovato."
+        )
 
-    raise RuntimeError(
-        f"Anno {year}: conteggio "
-        f"'X estrazioni nel {year}' non trovato."
-    )
+    counts = {
+        int(m.group(1))
+        for m in matches
+    }
+
+    if len(counts) != 1:
+
+        raise RuntimeError(
+            f"Anno {year}: conteggi "
+            f"contraddittori nella pagina: "
+            f"{sorted(counts)}"
+        )
+
+    return counts.pop()
 
 
 # ============================================================================
@@ -401,164 +481,187 @@ def parse_annual_page(
     year: int,
 ) -> tuple[pd.DataFrame, dict]:
 
-    lines = html_to_lines(html)
+    text = html_to_text(
+        html
+    )
 
-    if not lines:
+    if not text:
+
         raise RuntimeError(
-            f"Anno {year}: nessuna riga visibile."
+            f"Anno {year}: "
+            "testo della pagina vuoto."
         )
 
+    # ------------------------------------------------------------------------
+    # 1. CONTEGGIO DICHIARATO
+    # ------------------------------------------------------------------------
+
     declared_count = get_declared_count(
-        lines,
+        text,
         year,
     )
 
-    records = []
-
-    historical_count = 0
-    modern_count = 0
-
-    diagnostic_failures = []
-
     # ------------------------------------------------------------------------
-    # Scansione sequenziale.
-    #
-    # Non cerchiamo più "sei numeri in un blocco".
-    #
-    # Cerchiamo:
-    #
-    # HEADER
-    #   ↓
-    # RIGA IMMEDIATAMENTE SUCCESSIVA
-    #   ↓
-    # ESATTAMENTE 6 NUMERI
+    # 2. PARSING FORMATO STORICO
     # ------------------------------------------------------------------------
 
-    i = 0
+    historical_matches = list(
+        HISTORICAL_RE.finditer(
+            text
+        )
+    )
 
-    while i < len(lines):
+    # ------------------------------------------------------------------------
+    # 3. PARSING FORMATO MODERNO
+    # ------------------------------------------------------------------------
 
-        line = lines[i]
+    modern_matches = list(
+        MODERN_RE.finditer(
+            text
+        )
+    )
 
-        historical = HISTORICAL_HEADER_RE.match(line)
-        modern = MODERN_HEADER_RE.match(line)
+    # ------------------------------------------------------------------------
+    # IMPORTANTE:
+    #
+    # Se entrambi i parser trovano record, non scegliamo arbitrariamente.
+    # La pagina sarebbe ambigua.
+    # ------------------------------------------------------------------------
 
-        if not historical and not modern:
-            i += 1
-            continue
+    if (
+        historical_matches and
+        modern_matches
+    ):
 
-        # --------------------------------------------------------------
-        # HEADER STORICO
-        # --------------------------------------------------------------
-
-        if historical:
-
-            historical_count += 1
-
-            contest = int(
-                historical.group(1)
-            )
-
-            date_text = historical.group(2)
-
-            mode = "CONCORSO"
-
-        # --------------------------------------------------------------
-        # HEADER MODERNO
-        # --------------------------------------------------------------
-
-        else:
-
-            modern_count += 1
-
-            contest = None
-
-            date_text = modern.group(1)
-
-            mode = "MODERNO"
-
-        # --------------------------------------------------------------
-        # DATA
-        # --------------------------------------------------------------
-
-        date_iso = validate_date(
-            date_text,
-            year,
+        raise RuntimeError(
+            f"Anno {year}: "
+            "rilevati contemporaneamente "
+            "formato storico e formato moderno."
         )
 
-        # --------------------------------------------------------------
-        # RIGA SUCCESSIVA
-        # --------------------------------------------------------------
+    records = []
 
-        next_index = i + 1
+    # =========================================================================
+    # FORMATO STORICO
+    # =========================================================================
 
-        if next_index >= len(lines):
+    if historical_matches:
 
-            raise RuntimeError(
-                f"Anno {year}, data {date_text}: "
-                "nessuna riga disponibile dopo l'intestazione."
+        for match in historical_matches:
+
+            contest = int(
+                match.group(1)
             )
 
-        number_line = lines[next_index]
+            date_text = match.group(2)
 
-        try:
+            numbers_text = match.group(3)
 
-            numbers = parse_six_numbers(
-                number_line,
+            date_iso = validate_date(
+                date_text,
+                year,
+            )
+
+            numbers = parse_numbers(
+                numbers_text,
                 year,
                 contest,
                 date_text,
             )
 
-        except Exception as exc:
-
-            diagnostic_failures.append({
-                "index": i,
-                "mode": mode,
-                "contest": contest,
-                "date": date_text,
-                "header": line,
-                "next_line": number_line,
-                "error": str(exc),
+            records.append({
+                "year": year,
+                "data": date_iso,
+                "concorso": contest,
+                "n1": numbers[0],
+                "n2": numbers[1],
+                "n3": numbers[2],
+                "n4": numbers[3],
+                "n5": numbers[4],
+                "n6": numbers[5],
             })
 
+        parser_mode = "CONCORSO"
+
+    # =========================================================================
+    # FORMATO MODERNO
+    # =========================================================================
+
+    elif modern_matches:
+
+        temp_records = []
+
+        for match in modern_matches:
+
+            date_text = match.group(1)
+
+            numbers_text = match.group(2)
+
+            date_iso = validate_date(
+                date_text,
+                year,
+            )
+
+            numbers = parse_numbers(
+                numbers_text,
+                year,
+                None,
+                date_text,
+            )
+
+            temp_records.append({
+                "year": year,
+                "data": date_iso,
+                "concorso": None,
+                "n1": numbers[0],
+                "n2": numbers[1],
+                "n3": numbers[2],
+                "n4": numbers[3],
+                "n5": numbers[4],
+                "n6": numbers[5],
+            })
+
+        # La pagina è in ordine cronologico inverso.
+        # Il primo record è quindi l'ultimo concorso dell'anno.
+        #
+        # NON assumiamo 157.
+        # Usiamo esclusivamente il conteggio dichiarato dalla pagina.
+
+        if len(temp_records) != declared_count:
+
             raise RuntimeError(
-                f"Anno {year}, "
-                f"{'concorso ' + str(contest) if contest else 'data ' + date_text}: "
-                f"riga numeri non valida: {exc}"
-            ) from exc
+                f"Anno {year}: formato moderno "
+                f"ha prodotto "
+                f"{len(temp_records)} record, "
+                f"ma la pagina dichiara "
+                f"{declared_count}."
+            )
 
-        records.append({
-            "year": year,
-            "data": date_iso,
-            "concorso": contest,
-            "n1": numbers[0],
-            "n2": numbers[1],
-            "n3": numbers[2],
-            "n4": numbers[3],
-            "n5": numbers[4],
-            "n6": numbers[5],
-        })
+        for index, record in enumerate(
+            temp_records
+        ):
 
-        # --------------------------------------------------------------
-        # Saltiamo:
-        #
-        # i      header
-        # i + 1  sei numeri
-        #
-        # La riga Jolly viene semplicemente ignorata.
-        # --------------------------------------------------------------
+            record["concorso"] = (
+                declared_count - index
+            )
 
-        i += 2
+        records = temp_records
+
+        parser_mode = "MODERNO"
 
     # =========================================================================
-    # NESSUN RECORD
+    # NESSUN PARSER
     # =========================================================================
 
-    if not records:
+    else:
+
+        # Diagnostica utile senza stampare l'intera pagina.
+        sample = text[:1000]
 
         raise RuntimeError(
-            f"Anno {year}: nessuna estrazione riconosciuta."
+            f"Anno {year}: "
+            "nessun record riconosciuto. "
+            f"Anteprima testo: {sample!r}"
         )
 
     # =========================================================================
@@ -568,116 +671,139 @@ def parse_annual_page(
     if len(records) != declared_count:
 
         raise RuntimeError(
-            f"Anno {year}: parser ha prodotto "
-            f"{len(records)} estrazioni, "
-            f"ma la pagina dichiara "
-            f"{declared_count}."
-        )
-
-    # =========================================================================
-    # MODALITÀ
-    # =========================================================================
-
-    has_historical = historical_count > 0
-    has_modern = modern_count > 0
-
-    if has_historical and has_modern:
-
-        raise RuntimeError(
-            f"Anno {year}: pagina contiene contemporaneamente "
-            "formato storico e moderno. "
-            "Struttura ambigua."
-        )
-
-    # =========================================================================
-    # CONCORSI
-    # =========================================================================
-
-    if has_historical:
-
-        contests = [
-            int(r["concorso"])
-            for r in records
-        ]
-
-        # La pagina è in ordine decrescente.
-        expected_desc = list(
-            range(
-                max(contests),
-                min(contests) - 1,
-                -1,
-            )
-        )
-
-        if contests != expected_desc:
-
-            raise RuntimeError(
-                f"Anno {year}: sequenza concorsi inattesa. "
-                f"Letta={contests[:10]}..."
-            )
-
-        # Caso speciale 1997.
-        if year == 1997:
-
-            expected = list(
-                range(95, 86, -1)
-            )
-
-            if contests != expected:
-
-                raise RuntimeError(
-                    "Anno 1997: attesa sequenza "
-                    "95 -> 87."
-                )
-
-    else:
-
-        # ------------------------------------------------------------------
-        # Formato moderno.
-        #
-        # La pagina non espone il numero concorso, ma è ordinata
-        # dall'ultima estrazione alla prima.
-        #
-        # Se la pagina dichiara N estrazioni, la prima riga è concorso N,
-        # l'ultima è concorso 1.
-        # ------------------------------------------------------------------
-
-        for idx, record in enumerate(records):
-
-            record["concorso"] = (
-                declared_count - idx
-            )
-
-    # =========================================================================
-    # DATA
-    # =========================================================================
-
-    parsed_dates = [
-        pd.Timestamp(r["data"])
-        for r in records
-    ]
-
-    # La pagina è decrescente.
-    if parsed_dates != sorted(
-        parsed_dates,
-        reverse=True,
-    ):
-
-        raise RuntimeError(
-            f"Anno {year}: ordine cronologico "
-            "della pagina inatteso."
+            f"Anno {year}: "
+            f"{len(records)} record parsati "
+            f"contro {declared_count} dichiarati."
         )
 
     # =========================================================================
     # DATAFRAME
     # =========================================================================
 
-    df = pd.DataFrame(records)
+    df = pd.DataFrame(
+        records,
+        columns=[
+            "year",
+            "data",
+            "concorso",
+            "n1",
+            "n2",
+            "n3",
+            "n4",
+            "n5",
+            "n6",
+        ],
+    )
 
-    columns = [
-        "year",
-        "data",
-        "concorso",
+    # =========================================================================
+    # DUPLICATI
+    # =========================================================================
+
+    if df.duplicated(
+        subset=[
+            "year",
+            "concorso",
+        ],
+        keep=False,
+    ).any():
+
+        raise RuntimeError(
+            f"Anno {year}: "
+            "concorso duplicato."
+        )
+
+    # =========================================================================
+    # CONTROLLO DATE
+    # =========================================================================
+
+    dates = pd.to_datetime(
+        df["data"],
+        errors="raise",
+    )
+
+    if not (
+        dates.dt.year == year
+    ).all():
+
+        raise RuntimeError(
+            f"Anno {year}: "
+            "data fuori anno."
+        )
+
+    # La fonte presenta le estrazioni dalla più recente
+    # alla più vecchia.
+    if not dates.is_monotonic_decreasing:
+
+        raise RuntimeError(
+            f"Anno {year}: "
+            "ordine delle date inatteso."
+        )
+
+    # =========================================================================
+    # CONTROLLO CONCORSI
+    # =========================================================================
+
+    contests = (
+        df["concorso"]
+        .astype(int)
+        .tolist()
+    )
+
+    if parser_mode == "CONCORSO":
+
+        expected = list(
+            range(
+                contests[0],
+                contests[-1] - 1,
+                -1,
+            )
+        )
+
+        if contests != expected:
+
+            raise RuntimeError(
+                f"Anno {year}: "
+                "sequenza concorsi non consecutiva."
+            )
+
+        # Caso storico iniziale.
+        if year == 1997:
+
+            expected_1997 = list(
+                range(95, 86, -1)
+            )
+
+            if contests != expected_1997:
+
+                raise RuntimeError(
+                    "Anno 1997: "
+                    f"sequenza inattesa: "
+                    f"{contests}"
+                )
+
+    else:
+
+        expected = list(
+            range(
+                declared_count,
+                0,
+                -1,
+            )
+        )
+
+        if contests != expected:
+
+            raise RuntimeError(
+                f"Anno {year}: "
+                "numerazione ricostruita "
+                "non consecutiva."
+            )
+
+    # =========================================================================
+    # CONTROLLO NUMERI
+    # =========================================================================
+
+    number_columns = [
         "n1",
         "n2",
         "n3",
@@ -686,60 +812,63 @@ def parse_annual_page(
         "n6",
     ]
 
-    df = df[columns]
+    for idx, row in df.iterrows():
 
-    # =========================================================================
-    # CHIAVE UNIVOCA
-    # =========================================================================
+        nums = [
+            int(row[col])
+            for col in number_columns
+        ]
 
-    if df.duplicated(
-        subset=["year", "concorso"],
-        keep=False,
-    ).any():
+        if len(set(nums)) != 6:
 
-        raise RuntimeError(
-            f"Anno {year}: chiave "
-            "(year, concorso) duplicata."
-        )
+            raise RuntimeError(
+                f"Anno {year}, "
+                f"concorso {row['concorso']}: "
+                f"numeri duplicati {nums}"
+            )
+
+        if not all(
+            MIN_NUMBER <= n <= MAX_NUMBER
+            for n in nums
+        ):
+
+            raise RuntimeError(
+                f"Anno {year}, "
+                f"concorso {row['concorso']}: "
+                f"numero fuori 1-90: {nums}"
+            )
 
     # =========================================================================
     # LOG
     # =========================================================================
 
-    first_contest = int(
-        df["concorso"].min()
-    )
-
-    last_contest = int(
-        df["concorso"].max()
-    )
-
     log(
         f"Anno {year}: "
         f"{len(df)} estrazioni valide; "
-        f"concorsi {last_contest}->{first_contest}; "
-        f"parser={'CONCORSO' if has_historical else 'MODERNO'}."
+        f"concorsi "
+        f"{int(df['concorso'].max())}->"
+        f"{int(df['concorso'].min())}; "
+        f"parser={parser_mode}."
     )
 
     metadata = {
         "year": year,
         "declared_count": declared_count,
         "parsed_count": len(df),
-        "parser": (
-            "CONCORSO"
-            if has_historical
-            else "MODERNO"
+        "parser": parser_mode,
+        "first_contest": int(
+            df["concorso"].max()
         ),
-        "first_contest": first_contest,
-        "last_contest": last_contest,
-        "diagnostic_failures": diagnostic_failures,
+        "last_contest": int(
+            df["concorso"].min()
+        ),
     }
 
     return df, metadata
 
 
 # ============================================================================
-# ARCHIVIO COMPLETO
+# COSTRUZIONE ARCHIVIO
 # ============================================================================
 
 def download_and_build_archive():
@@ -752,15 +881,22 @@ def download_and_build_archive():
         END_YEAR + 1,
     ):
 
-        html = fetch_year(year)
+        html = fetch_year(
+            year
+        )
 
         df_year, meta = parse_annual_page(
             html,
             year,
         )
 
-        frames.append(df_year)
-        metadata.append(meta)
+        frames.append(
+            df_year
+        )
+
+        metadata.append(
+            meta
+        )
 
     if not frames:
 
@@ -773,12 +909,16 @@ def download_and_build_archive():
         ignore_index=True,
     )
 
-    # ------------------------------------------------------------------------
-    # Tipi
-    # ------------------------------------------------------------------------
+    # =========================================================================
+    # TIPI
+    # =========================================================================
 
     df["year"] = df["year"].astype(int)
-    df["concorso"] = df["concorso"].astype(int)
+
+    df["concorso"] = (
+        df["concorso"]
+        .astype(int)
+    )
 
     for col in [
         "n1",
@@ -788,21 +928,40 @@ def download_and_build_archive():
         "n5",
         "n6",
     ]:
-        df[col] = df[col].astype(int)
 
-    df["data"] = pd.to_datetime(
-        df["data"],
-        errors="raise",
-    ).dt.strftime("%Y-%m-%d")
+        df[col] = (
+            df[col]
+            .astype(int)
+        )
 
-    # ------------------------------------------------------------------------
-    # Ordinamento cronologico
-    # ------------------------------------------------------------------------
+    df["data"] = (
+        pd.to_datetime(
+            df["data"],
+            errors="raise",
+        )
+        .dt.strftime(
+            "%Y-%m-%d"
+        )
+    )
+
+    # =========================================================================
+    # ORDINAMENTO GLOBALE
+    # =========================================================================
 
     df = df.sort_values(
-        ["data", "concorso"],
-        ascending=[True, True],
-    ).reset_index(drop=True)
+        [
+            "data",
+            "year",
+            "concorso",
+        ],
+        ascending=[
+            True,
+            True,
+            True,
+        ],
+    ).reset_index(
+        drop=True
+    )
 
     return df, metadata
 
@@ -831,7 +990,7 @@ def audit_global(
     ]
 
     # ------------------------------------------------------------------------
-    # Schema
+    # SCHEMA
     # ------------------------------------------------------------------------
 
     if list(df.columns) != expected_columns:
@@ -841,31 +1000,73 @@ def audit_global(
         )
 
     # ------------------------------------------------------------------------
-    # Righe duplicate
+    # DUPLICATI COMPLETI
     # ------------------------------------------------------------------------
 
     if df.duplicated().any():
 
         errors.append(
-            "Esistono righe completamente duplicate."
+            "Righe completamente duplicate."
         )
 
     # ------------------------------------------------------------------------
-    # Chiave primaria
+    # CHIAVE PRIMARIA
     # ------------------------------------------------------------------------
 
     if df.duplicated(
-        subset=["year", "concorso"],
+        subset=[
+            "year",
+            "concorso",
+        ],
         keep=False,
     ).any():
 
         errors.append(
-            "Esistono duplicati sulla chiave "
+            "Duplicati sulla chiave "
             "(year, concorso)."
         )
 
     # ------------------------------------------------------------------------
-    # Numeri
+    # ANNI
+    # ------------------------------------------------------------------------
+
+    actual_years = set(
+        df["year"].astype(int)
+    )
+
+    expected_years = set(
+        range(
+            START_YEAR,
+            END_YEAR + 1,
+        )
+    )
+
+    missing = (
+        expected_years -
+        actual_years
+    )
+
+    extra = (
+        actual_years -
+        expected_years
+    )
+
+    if missing:
+
+        errors.append(
+            f"Anni mancanti: "
+            f"{sorted(missing)}"
+        )
+
+    if extra:
+
+        errors.append(
+            f"Anni inattesi: "
+            f"{sorted(extra)}"
+        )
+
+    # ------------------------------------------------------------------------
+    # NUMERI
     # ------------------------------------------------------------------------
 
     number_columns = [
@@ -887,7 +1088,8 @@ def audit_global(
         if values.isna().any():
 
             errors.append(
-                f"{col}: valori non numerici o mancanti."
+                f"{col}: valori mancanti "
+                "o non numerici."
             )
 
         elif not values.between(
@@ -896,11 +1098,12 @@ def audit_global(
         ).all():
 
             errors.append(
-                f"{col}: valore fuori intervallo 1-90."
+                f"{col}: valori fuori "
+                "intervallo 1-90."
             )
 
     # ------------------------------------------------------------------------
-    # Sei distinti per riga
+    # SEI NUMERI DISTINTI
     # ------------------------------------------------------------------------
 
     for idx, row in df.iterrows():
@@ -913,11 +1116,12 @@ def audit_global(
         if len(set(nums)) != 6:
 
             errors.append(
-                f"Riga {idx}: numeri duplicati {nums}."
+                f"Riga {idx}: "
+                f"numeri duplicati {nums}."
             )
 
     # ------------------------------------------------------------------------
-    # Date
+    # DATE
     # ------------------------------------------------------------------------
 
     dates = pd.to_datetime(
@@ -928,48 +1132,11 @@ def audit_global(
     if dates.isna().any():
 
         errors.append(
-            "Esistono date non valide."
+            "Date non valide."
         )
 
     # ------------------------------------------------------------------------
-    # Copertura anni
-    # ------------------------------------------------------------------------
-
-    actual_years = set(
-        df["year"].astype(int)
-    )
-
-    expected_years = set(
-        range(
-            START_YEAR,
-            END_YEAR + 1,
-        )
-    )
-
-    missing_years = (
-        expected_years - actual_years
-    )
-
-    extra_years = (
-        actual_years - expected_years
-    )
-
-    if missing_years:
-
-        errors.append(
-            f"Anni mancanti: "
-            f"{sorted(missing_years)}"
-        )
-
-    if extra_years:
-
-        errors.append(
-            f"Anni inattesi: "
-            f"{sorted(extra_years)}"
-        )
-
-    # ------------------------------------------------------------------------
-    # Controllo metadati annuali
+    # METADATI
     # ------------------------------------------------------------------------
 
     for meta in metadata:
@@ -982,26 +1149,9 @@ def audit_global(
             errors.append(
                 f"Anno {meta['year']}: "
                 f"conteggio dichiarato "
-                f"{meta['declared_count']} != "
-                f"parsato "
+                f"{meta['declared_count']} "
+                f"!= parsato "
                 f"{meta['parsed_count']}."
-            )
-
-    # ------------------------------------------------------------------------
-    # Controllo date dentro l'anno
-    # ------------------------------------------------------------------------
-
-    for year, group in df.groupby("year"):
-
-        group_years = pd.to_datetime(
-            group["data"]
-        ).dt.year
-
-        if not (group_years == int(year)).all():
-
-            errors.append(
-                f"Anno {year}: una o più date "
-                "non appartengono all'anno."
             )
 
     return errors
@@ -1011,7 +1161,9 @@ def audit_global(
 # EXPORT
 # ============================================================================
 
-def export_csv(df: pd.DataFrame) -> None:
+def export_csv(
+    df: pd.DataFrame,
+) -> None:
 
     columns = [
         "data",
@@ -1031,7 +1183,8 @@ def export_csv(df: pd.DataFrame) -> None:
     )
 
     log(
-        f"CSV generato: {OUTPUT_CSV} "
+        f"CSV generato: "
+        f"{OUTPUT_CSV} "
         f"({len(df)} righe)."
     )
 
@@ -1046,15 +1199,17 @@ def write_report(
     metadata,
     errors,
     warnings,
-):
+) -> None:
 
     report = {
         "pipeline_version": VERSION,
-        "generated_at": datetime.now().isoformat(),
+        "generated_at": (
+            datetime.now().isoformat()
+        ),
         "status": status,
         "engine_enabled": ENGINE_ENABLED,
         "source": "estrazioni.it",
-        "source_url": SOURCE_URL,
+        "source_url_pattern": SOURCE_URL,
         "start_year": START_YEAR,
         "end_year": END_YEAR,
         "total_records": (
@@ -1062,12 +1217,14 @@ def write_report(
             if df is not None
             else 0
         ),
-        "metadata": metadata,
+        "years": metadata,
         "errors": errors,
         "warnings": warnings,
     }
 
-    Path(REPORT_JSON).write_text(
+    Path(
+        REPORT_JSON
+    ).write_text(
         json.dumps(
             report,
             indent=2,
@@ -1093,7 +1250,9 @@ def main() -> int:
         f"— STRICT DATA INTEGRITY AUDIT"
     )
 
-    log("ENGINE DISABLED")
+    log(
+        "ENGINE DISABLED"
+    )
 
     errors = []
     warnings = []
@@ -1104,7 +1263,7 @@ def main() -> int:
     try:
 
         # ====================================================================
-        # 1. ACQUISIZIONE
+        # ACQUISIZIONE
         # ====================================================================
 
         df, metadata = (
@@ -1118,7 +1277,7 @@ def main() -> int:
         )
 
         # ====================================================================
-        # 2. AUDIT
+        # AUDIT
         # ====================================================================
 
         errors.extend(
@@ -1129,7 +1288,7 @@ def main() -> int:
         )
 
         # ====================================================================
-        # 3. RISULTATO
+        # FAIL CLOSED
         # ====================================================================
 
         if errors:
@@ -1145,11 +1304,13 @@ def main() -> int:
             log(
                 "=================================================="
             )
+
             log(
                 "AUDIT FAILED — ARCHIVIO NON UTILIZZABILE"
             )
 
             for error in errors:
+
                 log(
                     f"ERROR: {error}"
                 )
@@ -1161,13 +1322,15 @@ def main() -> int:
             return 1
 
         # ====================================================================
-        # 4. EXPORT
+        # EXPORT
         # ====================================================================
 
-        export_csv(df)
+        export_csv(
+            df
+        )
 
         # ====================================================================
-        # 5. REPORT PASS
+        # PASS
         # ====================================================================
 
         write_report(
@@ -1181,34 +1344,46 @@ def main() -> int:
         log(
             "=================================================="
         )
+
         log(
             "AUDIT PASSED"
         )
+
         log(
-            f"Record validi: {len(df)}"
+            f"Record validi: "
+            f"{len(df)}"
         )
+
         log(
-            f"Periodo: {df['data'].min()} -> "
+            f"Periodo: "
+            f"{df['data'].min()} -> "
             f"{df['data'].max()}"
         )
-        log(
-            "Schema verificato."
-        )
-        log(
-            "Numeri verificati."
-        )
-        log(
-            "Date verificate."
-        )
-        log(
-            "Chiavi (anno, concorso) verificate."
-        )
+
         log(
             "Conteggi annuali verificati."
         )
+
+        log(
+            "Date verificate."
+        )
+
+        log(
+            "Numeri 1-90 verificati."
+        )
+
+        log(
+            "Sei numeri distinti verificati."
+        )
+
+        log(
+            "Chiavi (anno, concorso) verificate."
+        )
+
         log(
             "ENGINE DISABLED."
         )
+
         log(
             "=================================================="
         )
@@ -1221,23 +1396,31 @@ def main() -> int:
             f"{type(exc).__name__}: {exc}"
         )
 
-        write_report(
-            "FAILED",
-            df,
-            metadata,
-            errors,
-            warnings,
-        )
+        try:
+
+            write_report(
+                "FAILED",
+                df,
+                metadata,
+                errors,
+                warnings,
+            )
+
+        except Exception:
+            pass
 
         log(
             "=================================================="
         )
+
         log(
             "AUDIT FAILED — FAIL CLOSED"
         )
+
         log(
             f"{type(exc).__name__}: {exc}"
         )
+
         log(
             "=================================================="
         )
@@ -1250,4 +1433,6 @@ def main() -> int:
 # ============================================================================
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(
+        main()
+    )
