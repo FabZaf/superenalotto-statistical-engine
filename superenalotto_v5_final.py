@@ -2,24 +2,23 @@
 # -*- coding: utf-8 -*-
 
 """
-SUPERNALOTTO STATISTICAL ENGINE
-V5.6
+SUPERNALOTTO STATISTICAL ENGINE V5.7
 
 STRICT HISTORICAL DATA ACQUISITION + INTEGRITY AUDIT
 
-FASE ATTUALE:
+Engine statistico DISABILITATO.
+
+La pipeline esegue esclusivamente:
 - acquisizione storico
-- validazione dati
+- validazione
 - ricostruzione deterministica dei concorsi mancanti
+- audit globale
 - export CSV
 - report JSON
 
-ENGINE STATISTICO:
-DISABILITATO
-
-Nessuna previsione.
-Nessuna generazione di combinazioni.
-Nessun test statistico in questa fase.
+NESSUNA previsione.
+NESSUNA generazione di combinazioni.
+NESSUN test statistico.
 """
 
 from __future__ import annotations
@@ -41,7 +40,7 @@ import requests
 # CONFIGURAZIONE
 # ============================================================================
 
-VERSION = "V5.6"
+VERSION = "V5.7"
 
 SOURCE_URL = (
     "https://www.estrazioni.it/superenalotto/?anno={year}"
@@ -83,7 +82,7 @@ def log(message: str) -> None:
 # NORMALIZZAZIONE
 # ============================================================================
 
-def normalize_unicode(text: str) -> str:
+def normalize_text(text: str) -> str:
     text = unicodedata.normalize(
         "NFKC",
         text,
@@ -107,19 +106,11 @@ def normalize_unicode(text: str) -> str:
             new,
         )
 
-    return text
-
-
-def normalize_text(text: str) -> str:
-    text = normalize_unicode(text)
-
-    text = re.sub(
+    return re.sub(
         r"\s+",
         " ",
         text,
-    )
-
-    return text.strip()
+    ).strip()
 
 
 # ============================================================================
@@ -149,28 +140,29 @@ class FlatTextParser(HTMLParser):
         tag,
         attrs,
     ):
-        tag = tag.lower()
-
-        if tag in self.SKIP_TAGS:
+        if tag.lower() in self.SKIP_TAGS:
             self.skip_depth += 1
 
     def handle_endtag(
         self,
         tag,
     ):
-        tag = tag.lower()
-
-        if tag in self.SKIP_TAGS:
-            if self.skip_depth > 0:
-                self.skip_depth -= 1
+        if (
+            tag.lower() in self.SKIP_TAGS
+            and self.skip_depth > 0
+        ):
+            self.skip_depth -= 1
 
     def handle_data(
         self,
         data,
     ):
-        if self.skip_depth == 0:
-            if data and data.strip():
-                self.parts.append(data)
+        if (
+            self.skip_depth == 0
+            and data
+            and data.strip()
+        ):
+            self.parts.append(data)
 
     def get_text(self) -> str:
         return normalize_text(
@@ -200,7 +192,6 @@ SESSION.headers.update({
     "User-Agent": (
         "Mozilla/5.0 (X11; Linux x86_64) "
         "AppleWebKit/537.36 "
-        "(KHTML, like Gecko) "
         "Chrome/131.0 Safari/537.36"
     ),
     "Accept": (
@@ -281,20 +272,6 @@ DECLARED_COUNT_RE = re.compile(
 )
 
 
-# Un unico parser per entrambi i formati.
-#
-# FORMATO CON NUMERO:
-#   Concorso n. 122 11/10/2014 06 11 28 43 56 83
-#
-# FORMATO SENZA NUMERO:
-#   SuperEnalotto 28/08/2014 22 39 51 78 83 84
-#
-# Importante:
-# catturiamo ESATTAMENTE i sei numeri immediatamente successivi
-# alla data.
-#
-# Il Jolly viene quindi automaticamente escluso.
-#
 DRAW_RE = re.compile(
     r"""
     (?:
@@ -306,12 +283,18 @@ DRAW_RE = re.compile(
         (?P<contest>\d+)
         \s+
     )?
+
     (?:
         SuperEnalotto
         \s+
     )?
-    (?P<date>\d{1,2}/\d{1,2}/\d{4})
+
+    (?P<date>
+        \d{1,2}/\d{1,2}/\d{4}
+    )
+
     \s+
+
     (?P<numbers>
         (?:\d{1,2}\s+){5}
         \d{1,2}
@@ -319,6 +302,43 @@ DRAW_RE = re.compile(
     """,
     re.IGNORECASE | re.VERBOSE,
 )
+
+
+# ============================================================================
+# CONTEGGIO DICHIARATO
+# ============================================================================
+
+def get_declared_count(
+    text: str,
+    year: int,
+) -> int:
+
+    counts = {
+        int(match.group(1))
+        for match in DECLARED_COUNT_RE.finditer(
+            text
+        )
+        if int(match.group(2)) == year
+    }
+
+    if not counts:
+
+        raise RuntimeError(
+            f"Anno {year}: "
+            f"conteggio "
+            f"'X estrazioni nel {year}' "
+            "non trovato."
+        )
+
+    if len(counts) != 1:
+
+        raise RuntimeError(
+            f"Anno {year}: "
+            "conteggi contraddittori: "
+            f"{sorted(counts)}"
+        )
+
+    return counts.pop()
 
 
 # ============================================================================
@@ -340,7 +360,8 @@ def validate_date(
     except ValueError as exc:
 
         raise RuntimeError(
-            f"Data non valida: {date_text}"
+            f"Data non valida: "
+            f"{date_text}"
         ) from exc
 
     if dt.year != expected_year:
@@ -372,20 +393,20 @@ def parse_numbers(
     if len(tokens) != MAIN_NUMBERS:
 
         raise RuntimeError(
-            f"Attesi 6 numeri principali, "
+            "Attesi 6 numeri principali, "
             f"trovati {len(tokens)}: "
             f"{numbers_text!r}"
         )
 
     numbers = tuple(
-        int(x)
-        for x in tokens
+        int(token)
+        for token in tokens
     )
 
     if any(
-        n < MIN_NUMBER or
-        n > MAX_NUMBER
-        for n in numbers
+        number < MIN_NUMBER
+        or number > MAX_NUMBER
+        for number in numbers
     ):
 
         raise RuntimeError(
@@ -404,82 +425,37 @@ def parse_numbers(
 
 
 # ============================================================================
-# CONTEGGIO DICHIARATO
-# ============================================================================
-
-def get_declared_count(
-    text: str,
-    year: int,
-) -> int:
-
-    matches = list(
-        DECLARED_COUNT_RE.finditer(
-            text
-        )
-    )
-
-    matches = [
-        m
-        for m in matches
-        if int(m.group(2)) == year
-    ]
-
-    if not matches:
-
-        raise RuntimeError(
-            f"Anno {year}: conteggio "
-            f"'X estrazioni nel {year}' "
-            f"non trovato."
-        )
-
-    counts = {
-        int(m.group(1))
-        for m in matches
-    }
-
-    if len(counts) != 1:
-
-        raise RuntimeError(
-            f"Anno {year}: conteggi "
-            f"contraddittori nella pagina: "
-            f"{sorted(counts)}"
-        )
-
-    return counts.pop()
-
-
-# ============================================================================
 # RICOSTRUZIONE CONCORSI
 # ============================================================================
 
 def reconstruct_contests(
     records: list[dict],
     year: int,
+    declared_count: int,
 ) -> None:
     """
-    Ricostruisce i numeri di concorso mancanti.
+    Ricostruzione deterministica.
 
-    PRINCIPIO:
+    CASO A — formato moderno puro
+    --------------------------------
+    Nessun numero di concorso esplicito.
 
-    I record sono già ordinati come nella pagina, dal più recente
-    al più vecchio.
+    Se la pagina dichiara N estrazioni e abbiamo
+    esattamente N record, la sequenza viene ricostruita:
 
-    Se due record hanno concorso noto:
+        N, N-1, ..., 1
 
-        posizione i -> concorso A
-        posizione j -> concorso B
+    CASO B — formato misto
+    -----------------------
+    Esistono alcuni concorsi espliciti.
 
-    allora deve valere:
+    Gli anchor espliciti vengono usati per ricostruire
+    esclusivamente i record mancanti.
 
-        A - B == j - i
+    La distanza tra posizione e concorso deve essere
+    perfettamente coerente.
 
-    cioè ogni estrazione rappresenta esattamente un concorso
-    consecutivo.
-
-    I record senza numero vengono quindi ricostruiti solo quando
-    la sequenza è matematicamente determinata dagli anchor noti.
-
-    Non viene mai inventato un concorso arbitrariamente.
+    Nessun numero viene inventato arbitrariamente.
     """
 
     if not records:
@@ -491,55 +467,87 @@ def reconstruct_contests(
     known = [
         (
             index,
-            record["concorso"],
+            int(record["concorso"]),
         )
         for index, record in enumerate(records)
         if record["concorso"] is not None
     ]
 
+    # ------------------------------------------------------------------
+    # CASO A: NESSUN CONCORSO ESPLICITO
+    # ------------------------------------------------------------------
+
     if not known:
 
-        raise RuntimeError(
-            f"Anno {year}: nessun concorso "
-            "esplicito disponibile per "
-            "ricostruire la numerazione."
+        for index, record in enumerate(
+            records
+        ):
+
+            record["concorso"] = (
+                declared_count - index
+            )
+
+        contests = [
+            int(record["concorso"])
+            for record in records
+        ]
+
+        expected = list(
+            range(
+                declared_count,
+                0,
+                -1,
+            )
         )
 
-    # ----------------------------------------------------------------------
-    # CONTROLLO ANCHOR ESPLICITI
-    # ----------------------------------------------------------------------
-
-    for k in range(
-        len(known) - 1
-    ):
-
-        index_a, contest_a = known[k]
-        index_b, contest_b = known[k + 1]
-
-        expected_difference = (
-            index_b - index_a
-        )
-
-        actual_difference = (
-            contest_a - contest_b
-        )
-
-        if actual_difference != expected_difference:
+        if contests != expected:
 
             raise RuntimeError(
                 f"Anno {year}: "
-                "incoerenza tra concorsi espliciti. "
-                f"Record posizione {index_a}: "
-                f"{contest_a}; "
-                f"posizione {index_b}: "
-                f"{contest_b}; "
-                f"distanza record={expected_difference}, "
-                f"distanza concorsi={actual_difference}."
+                "numerazione moderna "
+                "ricostruita incoerente."
             )
 
-    # ----------------------------------------------------------------------
-    # RICOSTRUZIONE PRIMA DEL PRIMO ANCHOR
-    # ----------------------------------------------------------------------
+        return
+
+    # ------------------------------------------------------------------
+    # CASO B: ANCHOR ESPLICITI
+    # ------------------------------------------------------------------
+
+    for (
+        (index_a, contest_a),
+        (index_b, contest_b),
+    ) in zip(
+        known,
+        known[1:],
+    ):
+
+        record_distance = (
+            index_b - index_a
+        )
+
+        contest_distance = (
+            contest_a - contest_b
+        )
+
+        if (
+            contest_distance
+            != record_distance
+        ):
+
+            raise RuntimeError(
+                f"Anno {year}: "
+                "incoerenza tra concorsi "
+                "espliciti: "
+                f"posizioni "
+                f"{index_a}/{index_b}, "
+                f"concorsi "
+                f"{contest_a}/{contest_b}."
+            )
+
+    # ------------------------------------------------------------------
+    # PRIMA DEL PRIMO ANCHOR
+    # ------------------------------------------------------------------
 
     first_index, first_contest = known[0]
 
@@ -554,16 +562,17 @@ def reconstruct_contests(
             + (first_index - index)
         )
 
-    # ----------------------------------------------------------------------
-    # RICOSTRUZIONE TRA GLI ANCHOR
-    # ----------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # TRA GLI ANCHOR
+    # ------------------------------------------------------------------
 
-    for k in range(
-        len(known) - 1
+    for (
+        (index_a, contest_a),
+        (index_b, contest_b),
+    ) in zip(
+        known,
+        known[1:],
     ):
-
-        index_a, contest_a = known[k]
-        index_b, contest_b = known[k + 1]
 
         for index in range(
             index_a + 1,
@@ -575,9 +584,9 @@ def reconstruct_contests(
                 - (index - index_a)
             )
 
-    # ----------------------------------------------------------------------
-    # RICOSTRUZIONE DOPO L'ULTIMO ANCHOR
-    # ----------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # DOPO L'ULTIMO ANCHOR
+    # ------------------------------------------------------------------
 
     last_index, last_contest = known[-1]
 
@@ -591,12 +600,12 @@ def reconstruct_contests(
             - (index - last_index)
         )
 
-    # ----------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # CONTROLLO FINALE
-    # ----------------------------------------------------------------------
+    # ------------------------------------------------------------------
 
     contests = [
-        record["concorso"]
+        int(record["concorso"])
         for record in records
     ]
 
@@ -607,14 +616,9 @@ def reconstruct_contests(
 
         raise RuntimeError(
             f"Anno {year}: "
-            "impossibile ricostruire tutti "
-            "i numeri di concorso."
+            "impossibile ricostruire "
+            "tutti i concorsi."
         )
-
-    contests = [
-        int(contest)
-        for contest in contests
-    ]
 
     expected = list(
         range(
@@ -628,8 +632,8 @@ def reconstruct_contests(
 
         raise RuntimeError(
             f"Anno {year}: "
-            "sequenza concorsi ricostruita "
-            "non consecutiva."
+            "sequenza concorsi "
+            "ricostruita non consecutiva."
         )
 
 
@@ -668,14 +672,16 @@ def parse_annual_page(
 
         raise RuntimeError(
             f"Anno {year}: "
-            "nessuna estrazione riconosciuta. "
-            f"Anteprima: {text[:1000]!r}"
+            "nessuna estrazione "
+            "riconosciuta. "
+            f"Anteprima: "
+            f"{text[:1000]!r}"
         )
 
     records = []
 
-    explicit_contests = 0
-    implicit_contests = 0
+    explicit_count = 0
+    implicit_count = 0
 
     for match in matches:
 
@@ -703,14 +709,14 @@ def parse_annual_page(
         if contest_text is None:
 
             contest = None
-            implicit_contests += 1
+            implicit_count += 1
 
         else:
 
             contest = int(
                 contest_text
             )
-            explicit_contests += 1
+            explicit_count += 1
 
         records.append({
             "year": year,
@@ -724,22 +730,23 @@ def parse_annual_page(
             "n6": numbers[5],
         })
 
-    # ----------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # CONTEGGIO RECORD
-    # ----------------------------------------------------------------------
+    # ------------------------------------------------------------------
 
     if len(records) != declared_count:
 
         raise RuntimeError(
             f"Anno {year}: "
-            f"{len(records)} record riconosciuti "
-            f"contro {declared_count} "
+            f"{len(records)} record "
+            "riconosciuti contro "
+            f"{declared_count} "
             "estrazioni dichiarate."
         )
 
-    # ----------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # DATE
-    # ----------------------------------------------------------------------
+    # ------------------------------------------------------------------
 
     dates = pd.to_datetime(
         [
@@ -753,26 +760,28 @@ def parse_annual_page(
 
         raise RuntimeError(
             f"Anno {year}: "
-            "ordine cronologico inatteso."
+            "ordine cronologico "
+            "inatteso."
         )
 
-    # ----------------------------------------------------------------------
-    # RICOSTRUZIONE NUMERAZIONE
-    # ----------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # RICOSTRUZIONE CONCORSI
+    # ------------------------------------------------------------------
 
     reconstruct_contests(
         records,
         year,
+        declared_count,
     )
-
-    # ----------------------------------------------------------------------
-    # CONTROLLO CONCORSI POSITIVI
-    # ----------------------------------------------------------------------
 
     contests = [
         int(record["concorso"])
         for record in records
     ]
+
+    # ------------------------------------------------------------------
+    # VALIDITÀ CONCORSI
+    # ------------------------------------------------------------------
 
     if any(
         contest < 1
@@ -781,33 +790,60 @@ def parse_annual_page(
 
         raise RuntimeError(
             f"Anno {year}: "
-            f"numero di concorso non valido: "
-            f"{contests}"
+            "numero di concorso "
+            f"non valido: {contests}"
         )
 
-    # ----------------------------------------------------------------------
-    # CONTROLLO CHIAVI
-    # ----------------------------------------------------------------------
-
-    keys = [
-        (
-            year,
-            int(record["concorso"]),
-        )
-        for record in records
-    ]
-
-    if len(keys) != len(set(keys)):
+    if len(contests) != len(
+        set(contests)
+    ):
 
         raise RuntimeError(
             f"Anno {year}: "
-            "duplicazione della chiave "
-            "(year, concorso)."
+            "concorso duplicato."
         )
 
-    # ----------------------------------------------------------------------
+    expected = list(
+        range(
+            contests[0],
+            contests[-1] - 1,
+            -1,
+        )
+    )
+
+    if contests != expected:
+
+        raise RuntimeError(
+            f"Anno {year}: "
+            "sequenza concorsi "
+            "non consecutiva."
+        )
+
+    # ------------------------------------------------------------------
+    # CONTROLLO SPECIFICO 1997
+    # ------------------------------------------------------------------
+
+    if year == 1997:
+
+        expected_1997 = list(
+            range(
+                95,
+                86,
+                -1,
+            )
+        )
+
+        if contests != expected_1997:
+
+            raise RuntimeError(
+                f"Anno 1997: "
+                f"sequenza inattesa: "
+                f"{contests}"
+            )
+
+    # ------------------------------------------------------------------
     # DATAFRAME
-    # ----------------------------------------------------------------------
+    # ------------------------------------------------------------------
 
     df = pd.DataFrame(
         records,
@@ -824,9 +860,9 @@ def parse_annual_page(
         ],
     )
 
-    # ----------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # CONTROLLO NUMERI
-    # ----------------------------------------------------------------------
+    # ------------------------------------------------------------------
 
     number_columns = [
         "n1",
@@ -839,81 +875,63 @@ def parse_annual_page(
 
     for _, row in df.iterrows():
 
-        nums = [
-            int(row[col])
-            for col in number_columns
+        numbers = [
+            int(row[column])
+            for column in number_columns
         ]
 
-        if len(set(nums)) != 6:
+        if len(set(numbers)) != 6:
 
             raise RuntimeError(
                 f"Anno {year}, "
-                f"concorso {row['concorso']}: "
-                f"numeri duplicati {nums}"
+                f"concorso "
+                f"{row['concorso']}: "
+                f"numeri duplicati "
+                f"{numbers}"
             )
 
         if not all(
-            MIN_NUMBER <= n <= MAX_NUMBER
-            for n in nums
+            MIN_NUMBER <= number <= MAX_NUMBER
+            for number in numbers
         ):
 
             raise RuntimeError(
                 f"Anno {year}, "
-                f"concorso {row['concorso']}: "
-                f"numero fuori 1-90: {nums}"
+                f"concorso "
+                f"{row['concorso']}: "
+                f"numero fuori 1-90: "
+                f"{numbers}"
             )
 
-    # ----------------------------------------------------------------------
-    # CONTROLLO 1997
-    # ----------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # MODALITÀ
+    # ------------------------------------------------------------------
 
-    if year == 1997:
-
-        expected_1997 = list(
-            range(95, 86, -1)
-        )
-
-        if contests != expected_1997:
-
-            raise RuntimeError(
-                "Anno 1997: "
-                f"sequenza inattesa: "
-                f"{contests}"
-            )
-
-    # ----------------------------------------------------------------------
-    # MODALITÀ PARSER
-    # ----------------------------------------------------------------------
-
-    if implicit_contests == 0:
+    if implicit_count == 0:
 
         parser_mode = "ESPLICITO"
 
-    elif explicit_contests == 0:
+    elif explicit_count == 0:
 
-        parser_mode = "RICOSTRUITO"
+        parser_mode = "MODERNO"
 
     else:
 
         parser_mode = "MISTO"
 
-    reconstructed = (
-        implicit_contests > 0
-    )
-
-    # ----------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # LOG
-    # ----------------------------------------------------------------------
+    # ------------------------------------------------------------------
 
     log(
         f"Anno {year}: "
         f"{len(df)} estrazioni valide; "
         f"concorsi "
-        f"{int(df['concorso'].max())}->"
-        f"{int(df['concorso'].min())}; "
+        f"{contests[0]}->"
+        f"{contests[-1]}; "
         f"parser={parser_mode}; "
-        f"espliciti={explicit_contests}; "
-        f"ricostruiti={implicit_contests}."
+        f"espliciti={explicit_count}; "
+        f"ricostruiti={implicit_count}."
     )
 
     metadata = {
@@ -921,15 +939,10 @@ def parse_annual_page(
         "declared_count": declared_count,
         "parsed_count": len(df),
         "parser": parser_mode,
-        "explicit_contests": explicit_contests,
-        "reconstructed_contests": implicit_contests,
-        "reconstruction_used": reconstructed,
-        "first_contest": int(
-            df["concorso"].max()
-        ),
-        "last_contest": int(
-            df["concorso"].min()
-        ),
+        "explicit_contests": explicit_count,
+        "reconstructed_contests": implicit_count,
+        "first_contest": contests[0],
+        "last_contest": contests[-1],
     }
 
     return df, metadata
@@ -987,7 +1000,7 @@ def download_and_build_archive():
         .astype(int)
     )
 
-    for col in [
+    for column in [
         "n1",
         "n2",
         "n3",
@@ -996,8 +1009,8 @@ def download_and_build_archive():
         "n6",
     ]:
 
-        df[col] = (
-            df[col]
+        df[column] = (
+            df[column]
             .astype(int)
         )
 
@@ -1011,7 +1024,7 @@ def download_and_build_archive():
         )
     )
 
-    # Archivio finale cronologico crescente.
+    # CSV finale in ordine cronologico crescente.
     df = df.sort_values(
         [
             "data",
@@ -1078,9 +1091,9 @@ def audit_global(
             "(year, concorso)."
         )
 
-    # ----------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # ANNI
-    # ----------------------------------------------------------------------
+    # ------------------------------------------------------------------
 
     actual_years = set(
         df["year"].astype(int)
@@ -1117,9 +1130,9 @@ def audit_global(
             f"{sorted(extra)}"
         )
 
-    # ----------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # NUMERI
-    # ----------------------------------------------------------------------
+    # ------------------------------------------------------------------
 
     number_columns = [
         "n1",
@@ -1130,17 +1143,18 @@ def audit_global(
         "n6",
     ]
 
-    for col in number_columns:
+    for column in number_columns:
 
         values = pd.to_numeric(
-            df[col],
+            df[column],
             errors="coerce",
         )
 
         if values.isna().any():
 
             errors.append(
-                f"{col}: valori mancanti "
+                f"{column}: "
+                "valori mancanti "
                 "o non numerici."
             )
 
@@ -1150,27 +1164,29 @@ def audit_global(
         ).all():
 
             errors.append(
-                f"{col}: valori fuori "
+                f"{column}: "
+                "valori fuori "
                 "intervallo 1-90."
             )
 
-    for idx, row in df.iterrows():
+    for index, row in df.iterrows():
 
-        nums = [
-            int(row[col])
-            for col in number_columns
+        numbers = [
+            int(row[column])
+            for column in number_columns
         ]
 
-        if len(set(nums)) != 6:
+        if len(set(numbers)) != 6:
 
             errors.append(
-                f"Riga {idx}: "
-                f"numeri duplicati {nums}."
+                f"Riga {index}: "
+                f"numeri duplicati "
+                f"{numbers}."
             )
 
-    # ----------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # DATE
-    # ----------------------------------------------------------------------
+    # ------------------------------------------------------------------
 
     dates = pd.to_datetime(
         df["data"],
@@ -1183,9 +1199,9 @@ def audit_global(
             "Date non valide."
         )
 
-    # ----------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # CONTEGGI ANNUALI
-    # ----------------------------------------------------------------------
+    # ------------------------------------------------------------------
 
     for meta in metadata:
 
@@ -1202,9 +1218,9 @@ def audit_global(
                 f"{meta['parsed_count']}."
             )
 
-    # ----------------------------------------------------------------------
-    # CONTROLLO COMPLESSIVO DATA/ANNO
-    # ----------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # DATA ↔ ANNO
+    # ------------------------------------------------------------------
 
     for year in sorted(
         actual_years
@@ -1214,7 +1230,7 @@ def audit_global(
             df["year"] == year
         ]
 
-        years_from_dates = (
+        date_years = (
             pd.to_datetime(
                 subset["data"]
             )
@@ -1223,13 +1239,32 @@ def audit_global(
             .tolist()
         )
 
-        if years_from_dates != [year]:
+        if date_years != [year]:
 
             errors.append(
                 f"Anno {year}: "
-                f"date appartenenti ad anni "
-                f"diversi: "
-                f"{years_from_dates}"
+                "date appartenenti "
+                f"ad anni diversi: "
+                f"{date_years}"
+            )
+
+        # Nel CSV globale le date sono crescenti,
+        # quindi anche i concorsi devono risultare
+        # crescenti all'interno dell'anno.
+        contests = (
+            subset["concorso"]
+            .astype(int)
+            .tolist()
+        )
+
+        if contests != sorted(
+            contests
+        ):
+
+            errors.append(
+                f"Anno {year}: "
+                "ordine globale "
+                "dei concorsi non crescente."
             )
 
     return errors
@@ -1272,7 +1307,7 @@ def export_csv(
 # ============================================================================
 
 def write_report(
-    status: str,
+    status,
     df,
     metadata,
     errors,
@@ -1312,8 +1347,8 @@ def write_report(
     )
 
     log(
-        f"Report di integrità generato in "
-        f"'{REPORT_JSON}'."
+        f"Report di integrità generato "
+        f"in '{REPORT_JSON}'."
     )
 
 
@@ -1372,7 +1407,8 @@ def main() -> int:
             )
 
             log(
-                "AUDIT FAILED — ARCHIVIO NON UTILIZZABILE"
+                "AUDIT FAILED — "
+                "ARCHIVIO NON UTILIZZABILE"
             )
 
             for error in errors:
@@ -1435,12 +1471,13 @@ def main() -> int:
         )
 
         log(
-            "Chiavi (anno, concorso) verificate."
+            "Chiavi (anno, concorso) "
+            "verificate."
         )
 
         log(
-            "Ricostruzioni dei concorsi "
-            "verificate deterministicamente."
+            "Ricostruzioni deterministiche "
+            "verificate."
         )
 
         log(
