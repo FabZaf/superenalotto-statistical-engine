@@ -1,1 +1,39 @@
+name: SuperEnalotto V6 Statistical Test
 
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  v6-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configurazione Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Installazione dipendenze
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Esecuzione V6
+        run: |
+          python superenalotto_v6_statistical_engine.py
+
+      - name: Upload report V6
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: superenalotto-v6-reports
+          path: |
+            v6_discovery_report.json
+            v6_confirmation_report.json
+          if-no-files-found: warn
