@@ -1,0 +1,37 @@
+name: SuperEnalotto V5.8 Independent Audit
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  independent-audit:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configurazione Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Installazione dipendenze
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Esecuzione audit indipendente V5.8
+        run: |
+          python superenalotto_v5_8_independent_audit.py
+
+      - name: Upload report audit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: superenalotto-v5-8-independent-audit
+          path: independent_audit_report.json
+          if-no-files-found: warn
