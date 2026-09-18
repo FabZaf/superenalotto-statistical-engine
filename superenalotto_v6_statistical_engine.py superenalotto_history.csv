@@ -1,1 +1,971 @@
+#!/usr/bin/env python3
+"""
+SuperEnalotto Statistical Engine V6.0
+=====================================
+
+NON-PREDICTIVE STATISTICAL ANALYZER.
+No ticket generation. No look-ahead. No parameter optimization on OOS.
+
+Protocol:
+1) Discovery OOS: 2016-01-01 .. 2021-12-31
+2) Bonferroni correction across the 3 pre-registered strategies
+3) Confirmation OOS: 2022-01-01 .. 2026-current-date, ONLY for strategies
+   that survive Discovery
+4) Parameters/rules are frozen between Discovery and Confirmation
+5) Primary statistic = total number of hits
+6) H0 = independent uniform 6-of-90 draws
+7) Monte Carlo repeats the same adaptive strategy sequentially under H0,
+   keeping the real pre-window history fixed.
+
+Strategies:
+- FREQUENCY:
+    weighted sampling without replacement from 1..90,
+    weight = historical frequency + 1e-12
+- DELAY:
+    weighted sampling without replacement from 1..90,
+    weight = current delay + 1e-12
+- MIXED:
+    min-max normalize frequency and delay separately,
+    score = 0.5 * frequency_norm + 0.5 * delay_norm,
+    retain the top 30 numbers, then weighted sample 6 without replacement.
+
+The script reads the already validated superenalotto_history.csv.
+It does NOT modify V5.7/V5.8 files.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Sequence
+
+import numpy as np
+import pandas as pd
+
+
+VERSION = "V6.0"
+
+CSV_PATH = Path("superenalotto_history.csv")
+DISCOVERY_REPORT = Path("v6_discovery_report.json")
+CONFIRMATION_REPORT = Path("v6_confirmation_report.json")
+
+DISCOVERY_START = pd.Timestamp("2016-01-01")
+DISCOVERY_END = pd.Timestamp("2021-12-31")
+
+CONFIRMATION_START = pd.Timestamp("2022-01-01")
+CONFIRMATION_END = pd.Timestamp(datetime.now().date())
+
+BASE_SEED = 20260912
+
+# Can be overridden in GitHub Actions:
+# V6_N_RUNS=5000 python superenalotto_v6_statistical_engine.py
+N_RUNS = int(os.getenv("V6_N_RUNS", "1000"))
+
+ALPHA = 0.05
+N_STRATEGIES = 3
+BONFERRONI_ALPHA = ALPHA / N_STRATEGIES
+
+EPS = 1e-12
+MIXED_TOP_K = 30
+
+NUMBERS = np.arange(1, 91, dtype=int)
+
+EXPECTED_COLUMNS = [
+    "date", "contest", "n1", "n2", "n3", "n4", "n5", "n6"
+]
+
+
+def fail(message: str) -> None:
+    print(f"[V6][ERROR] {message}")
+    raise SystemExit(1)
+
+
+def load_history() -> pd.DataFrame:
+    if not CSV_PATH.exists():
+        fail(f"File mancante: {CSV_PATH}")
+
+    df = pd.read_csv(CSV_PATH)
+
+    if list(df.columns) != EXPECTED_COLUMNS:
+        fail(
+            "Schema CSV inatteso.\n"
+            f"Atteso: {EXPECTED_COLUMNS}\n"
+            f"Trovato: {list(df.columns)}"
+        )
+
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    if df["date"].isna().any():
+        fail("Sono presenti date non valide.")
+
+    for col in ["contest", "n1", "n2", "n3", "n4", "n5", "n6"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+        if df[col].isna().any():
+            fail(f"Sono presenti valori non numerici nella colonna {col}.")
+        df[col] = df[col].astype(int)
+
+    number_cols = ["n1", "n2", "n3", "n4", "n5", "n6"]
+
+    if df["date"].duplicated().any():
+        fail("Sono presenti date duplicate.")
+
+    if (
+        (df[number_cols] < 1) |
+        (df[number_cols] > 90)
+    ).any().any():
+        fail("Sono presenti numeri fuori dall'intervallo 1..90.")
+
+    duplicate_numbers = df[number_cols].apply(
+        lambda row: len(set(row.tolist())) != 6,
+        axis=1,
+    )
+    if duplicate_numbers.any():
+        fail("Sono presenti estrazioni con numeri duplicati.")
+
+    df = df.sort_values(["date", "contest"]).reset_index(drop=True)
+
+    if not df["date"].is_monotonic_increasing:
+        fail("La cronologia del CSV non è crescente.")
+
+    return df
+
+
+def draw_array(row: pd.Series) -> np.ndarray:
+    return row[
+        ["n1", "n2", "n3", "n4", "n5", "n6"]
+    ].to_numpy(dtype=int)
+
+
+def get_window(
+    df: pd.DataFrame,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    label: str,
+) -> pd.DataFrame:
+    window = df[
+        (df["date"] >= start) &
+        (df["date"] <= end)
+    ].copy()
+
+    if window.empty:
+        fail(f"La finestra {label} è vuota.")
+
+    if not window["date"].is_monotonic_increasing:
+        fail(f"La cronologia della finestra {label} non è crescente.")
+
+    return window
+
+
+def weighted_sample_without_replacement(
+    candidates: np.ndarray,
+    weights: np.ndarray,
+    k: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """
+    Sequential weighted sampling without replacement.
+
+    This is deliberately explicit so the same algorithm is used for
+    observed data and every Monte Carlo null replicate.
+    """
+    candidates = np.asarray(candidates, dtype=int)
+    weights = np.asarray(weights, dtype=float).copy()
+
+    if len(candidates) != len(weights):
+        raise ValueError("candidates/weights length mismatch")
+
+    weights = np.maximum(weights, EPS)
+
+    if (
+        not np.isfinite(weights).all()
+        or float(weights.sum()) <= 0
+    ):
+        weights = np.ones(len(candidates), dtype=float)
+
+    remaining = np.arange(len(candidates))
+    chosen: List[int] = []
+
+    for _ in range(k):
+        current_weights = weights[remaining]
+        probabilities = current_weights / current_weights.sum()
+
+        selected_position = int(
+            rng.choice(
+                remaining,
+                p=probabilities,
+            )
+        )
+
+        chosen.append(int(candidates[selected_position]))
+
+        remaining = remaining[
+            remaining != selected_position
+        ]
+
+    return np.array(chosen, dtype=int)
+
+
+@dataclass
+class StrategyState:
+    """
+    State available immediately BEFORE the next draw.
+
+    draws_seen:
+        number of historical draws already observed.
+
+    last_seen[n]:
+        zero-based index of the last observed draw containing n,
+        or -1 if n has never appeared.
+    """
+
+    freq: np.ndarray
+    last_seen: np.ndarray
+    draws_seen: int
+
+    @classmethod
+    def from_history(
+        cls,
+        history: Sequence[np.ndarray],
+    ) -> "StrategyState":
+        freq = np.zeros(91, dtype=np.int64)
+        last_seen = np.full(91, -1, dtype=np.int64)
+
+        draws_seen = 0
+
+        for draw in history:
+            for number in draw:
+                n = int(number)
+                freq[n] += 1
+                last_seen[n] = draws_seen
+
+            draws_seen += 1
+
+        return cls(
+            freq=freq,
+            last_seen=last_seen,
+            draws_seen=draws_seen,
+        )
+
+    def observe(self, draw: np.ndarray) -> None:
+        """
+        Update state ONLY after the actual/simulated draw is complete.
+        This is the key no-look-ahead rule.
+        """
+        for number in draw:
+            n = int(number)
+            self.freq[n] += 1
+            self.last_seen[n] = self.draws_seen
+
+        self.draws_seen += 1
+
+    def delay(self) -> np.ndarray:
+        """
+        Delay in number of draws since the last appearance.
+
+        Example:
+        - if a number appeared in the immediately preceding draw,
+          delay = 1
+        - if it appeared two draws ago, delay = 2
+        - if never seen, delay = draws_seen + 1
+
+        Index 0 is unused.
+        """
+        result = np.empty(91, dtype=float)
+
+        if self.draws_seen == 0:
+            result[:] = 1.0
+            return result
+
+        for n in range(1, 91):
+            if self.last_seen[n] < 0:
+                result[n] = float(self.draws_seen + 1)
+            else:
+                result[n] = float(
+                    self.draws_seen - self.last_seen[n]
+                )
+
+        return result
+
+
+def pick_frequency(
+    state: StrategyState,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    weights = (
+        state.freq[1:].astype(float) +
+        EPS
+    )
+
+    return weighted_sample_without_replacement(
+        NUMBERS,
+        weights,
+        6,
+        rng,
+    )
+
+
+def pick_delay(
+    state: StrategyState,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    weights = (
+        state.delay()[1:] +
+        EPS
+    )
+
+    return weighted_sample_without_replacement(
+        NUMBERS,
+        weights,
+        6,
+        rng,
+    )
+
+
+def minmax_normalize(values: np.ndarray) -> np.ndarray:
+    values = np.asarray(values, dtype=float)
+
+    minimum = float(values.min())
+    maximum = float(values.max())
+
+    if maximum > minimum:
+        return (
+            (values - minimum) /
+            (maximum - minimum)
+        )
+
+    return np.ones(len(values), dtype=float)
+
+
+def pick_mixed(
+    state: StrategyState,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    frequency = state.freq[1:].astype(float)
+    delay = state.delay()[1:]
+
+    frequency_norm = minmax_normalize(frequency)
+    delay_norm = minmax_normalize(delay)
+
+    score = (
+        0.5 * frequency_norm +
+        0.5 * delay_norm
+    )
+
+    # Deterministic tie-break:
+    # higher score first, then lower number first.
+    order = np.lexsort(
+        (NUMBERS, -score)
+    )
+
+    top_indices = order[:MIXED_TOP_K]
+
+    top_numbers = NUMBERS[top_indices]
+    top_weights = score[top_indices] + EPS
+
+    return weighted_sample_without_replacement(
+        top_numbers,
+        top_weights,
+        6,
+        rng,
+    )
+
+
+PICKERS = {
+    "FREQUENCY": pick_frequency,
+    "DELAY": pick_delay,
+    "MIXED": pick_mixed,
+}
+
+
+def random_draw(
+    rng: np.random.Generator,
+) -> np.ndarray:
+    return np.sort(
+        rng.choice(
+            NUMBERS,
+            size=6,
+            replace=False,
+        )
+    )
+
+
+def run_observed(
+    prehistory: Sequence[np.ndarray],
+    oos: pd.DataFrame,
+    strategy: str,
+    seed: int,
+) -> Dict:
+    """
+    Run the real OOS sequence.
+
+    At each OOS date:
+        1. select using state from PREVIOUS draws only
+        2. compare selection with the actual draw
+        3. update state with the actual draw
+    """
+    rng = np.random.default_rng(seed)
+    state = StrategyState.from_history(prehistory)
+
+    picker = PICKERS[strategy]
+
+    total_hits = 0
+    distribution = np.zeros(7, dtype=int)
+
+    trace = []
+
+    for _, row in oos.iterrows():
+        actual = draw_array(row)
+
+        selection = picker(
+            state,
+            rng,
+        )
+
+        hits = int(
+            np.intersect1d(
+                selection,
+                actual,
+            ).size
+        )
+
+        total_hits += hits
+        distribution[hits] += 1
+
+        trace.append(
+            {
+                "date": row["date"].strftime("%Y-%m-%d"),
+                "contest": int(row["contest"]),
+                "hits": hits,
+            }
+        )
+
+        # IMPORTANT: update AFTER scoring.
+        state.observe(actual)
+
+    return {
+        "strategy": strategy,
+        "seed": seed,
+        "draws": int(len(oos)),
+        "total_hits": int(total_hits),
+        "mean_hits_per_draw": float(
+            total_hits / len(oos)
+        ),
+        "hit_distribution_0_to_6": (
+            distribution.tolist()
+        ),
+        "trace": trace,
+    }
+
+
+def run_null_replicate(
+    prehistory: Sequence[np.ndarray],
+    n_draws: int,
+    strategy: str,
+    seed: int,
+) -> int:
+    """
+    One complete H0 simulation.
+
+    The real pre-window history is fixed.
+    Only the OOS future is randomized.
+
+    The same adaptive strategy is applied sequentially:
+        pick -> score -> observe simulated draw.
+    """
+    rng = np.random.default_rng(seed)
+
+    state = StrategyState.from_history(
+        prehistory
+    )
+
+    picker = PICKERS[strategy]
+
+    total_hits = 0
+
+    for _ in range(n_draws):
+        simulated_actual = random_draw(rng)
+
+        selection = picker(
+            state,
+            rng,
+        )
+
+        total_hits += int(
+            np.intersect1d(
+                selection,
+                simulated_actual,
+            ).size
+        )
+
+        state.observe(simulated_actual)
+
+    return total_hits
+
+
+def monte_carlo(
+    prehistory: Sequence[np.ndarray],
+    n_draws: int,
+    strategy: str,
+    observed_hits: int,
+    n_runs: int,
+    seed_base: int,
+) -> Dict:
+    null_hits = np.empty(
+        n_runs,
+        dtype=np.int64,
+    )
+
+    for replicate in range(n_runs):
+        null_hits[replicate] = run_null_replicate(
+            prehistory=prehistory,
+            n_draws=n_draws,
+            strategy=strategy,
+            seed=seed_base + replicate,
+        )
+
+    # One-sided upper-tail test because the research question is:
+    # "are there unusually many hits?"
+    extreme = int(
+        np.sum(
+            null_hits >= observed_hits
+        )
+    )
+
+    # +1 correction avoids p=0 in finite Monte Carlo.
+    p_upper = (
+        (extreme + 1) /
+        (n_runs + 1)
+    )
+
+    q025, q975 = np.quantile(
+        null_hits,
+        [0.025, 0.975],
+    )
+
+    return {
+        "n_runs": int(n_runs),
+        "seed_base": int(seed_base),
+        "null_total_hits_mean": float(
+            null_hits.mean()
+        ),
+        "null_total_hits_sd": float(
+            null_hits.std(ddof=1)
+        ) if n_runs > 1 else 0.0,
+        "null_total_hits_q025": float(q025),
+        "null_total_hits_q975": float(q975),
+        "null_total_hits_min": int(
+            null_hits.min()
+        ),
+        "null_total_hits_max": int(
+            null_hits.max()
+        ),
+        "observed_total_hits": int(
+            observed_hits
+        ),
+        "extreme_ge_observed": int(
+            extreme
+        ),
+        "p_upper_mc": float(
+            p_upper
+        ),
+    }
+
+
+def theoretical_random_expectation(
+    n_draws: int,
+) -> float:
+    """
+    Under uniform independent 6-of-90 draws,
+    any fixed/randomized 6-number selection has expected
+    intersection size 6*6/90 = 0.4 per draw.
+    """
+    return float(
+        n_draws * 36.0 / 90.0
+    )
+
+
+def strategy_definition() -> Dict:
+    return {
+        "FREQUENCY": (
+            "Weighted sampling without replacement over 1..90; "
+            "weight = historical frequency + 1e-12."
+        ),
+        "DELAY": (
+            "Weighted sampling without replacement over 1..90; "
+            "weight = current delay + 1e-12."
+        ),
+        "MIXED": (
+            "Frequency and delay min-max normalized separately; "
+            "score = 0.5*frequency_norm + 0.5*delay_norm; "
+            "top 30 retained; weighted sample of 6 without replacement."
+        ),
+    }
+
+
+def analyze_period(
+    df: pd.DataFrame,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    label: str,
+    n_runs: int,
+    seed_offset: int,
+) -> Dict:
+    oos = get_window(
+        df,
+        start,
+        end,
+        label,
+    )
+
+    pre = df[
+        df["date"] < start
+    ].copy()
+
+    if pre.empty:
+        fail(
+            f"Pre-history vuota per {label}."
+        )
+
+    prehistory = [
+        draw_array(row)
+        for _, row in pre.iterrows()
+    ]
+
+    results: Dict = {}
+
+    for index, strategy in enumerate(PICKERS):
+        observed_seed = (
+            BASE_SEED +
+            seed_offset +
+            index * 100_000
+        )
+
+        mc_seed = (
+            BASE_SEED +
+            seed_offset +
+            500_000 +
+            index * 100_000
+        )
+
+        observed = run_observed(
+            prehistory=prehistory,
+            oos=oos,
+            strategy=strategy,
+            seed=observed_seed,
+        )
+
+        mc = monte_carlo(
+            prehistory=prehistory,
+            n_draws=len(oos),
+            strategy=strategy,
+            observed_hits=observed["total_hits"],
+            n_runs=n_runs,
+            seed_base=mc_seed,
+        )
+
+        raw_p = mc["p_upper_mc"]
+
+        # Bonferroni is applied to the 3-strategy Discovery family.
+        bonferroni_p = min(
+            1.0,
+            raw_p * N_STRATEGIES,
+        )
+
+        results[strategy] = {
+            "observed": observed,
+            "monte_carlo": mc,
+            "p_upper_mc_bonferroni": float(
+                bonferroni_p
+            ),
+            "random_theoretical_expected_total_hits": (
+                theoretical_random_expectation(
+                    len(oos)
+                )
+            ),
+        }
+
+    return {
+        "engine_version": VERSION,
+        "label": label,
+        "start": start.strftime("%Y-%m-%d"),
+        "end": end.strftime("%Y-%m-%d"),
+        "draws": int(len(oos)),
+        "prehistory_last_date": (
+            pre["date"].max().strftime("%Y-%m-%d")
+        ),
+        "h0": (
+            "independent uniform 6-of-90 draws"
+        ),
+        "primary_statistic": "total_hits",
+        "strategies": results,
+    }
+
+
+def main() -> None:
+    print("=" * 72)
+    print(
+        f"SUPERENALOTTO STATISTICAL ENGINE {VERSION}"
+    )
+    print("=" * 72)
+
+    if N_RUNS < 100:
+        fail(
+            "V6_N_RUNS deve essere >= 100."
+        )
+
+    df = load_history()
+
+    print(
+        f"[V6] Record caricati: {len(df)}"
+    )
+    print(
+        f"[V6] Monte Carlo runs: {N_RUNS}"
+    )
+    print(
+        "[V6] Discovery: 2016-01-01 -> 2021-12-31"
+    )
+    print(
+        "[V6] Confirmation: 2022-01-01 -> "
+        f"{CONFIRMATION_END.strftime('%Y-%m-%d')}"
+    )
+
+    discovery = analyze_period(
+        df=df,
+        start=DISCOVERY_START,
+        end=DISCOVERY_END,
+        label="DISCOVERY",
+        n_runs=N_RUNS,
+        seed_offset=0,
+    )
+
+    survivors = []
+
+    print("\n" + "=" * 72)
+    print("DISCOVERY OOS 2016-2021")
+    print("=" * 72)
+
+    for strategy, result in discovery["strategies"].items():
+        raw_p = result[
+            "monte_carlo"
+        ]["p_upper_mc"]
+
+        bonf_p = result[
+            "p_upper_mc_bonferroni"
+        ]
+
+        survives = (
+            bonf_p < ALPHA
+        )
+
+        result["discovery_survives"] = bool(
+            survives
+        )
+
+        if survives:
+            survivors.append(
+                strategy
+            )
+
+        print(
+            f"{strategy}: "
+            f"hits={result['observed']['total_hits']} | "
+            f"null_mean={result['monte_carlo']['null_total_hits_mean']:.2f} | "
+            f"p={raw_p:.5f} | "
+            f"p_Bonf={bonf_p:.5f} | "
+            f"survives={survives}"
+        )
+
+    discovery_output = {
+        **discovery,
+        "protocol": {
+            "alpha": ALPHA,
+            "number_of_strategies": N_STRATEGIES,
+            "bonferroni_alpha_per_test": (
+                BONFERRONI_ALPHA
+            ),
+            "no_look_ahead": True,
+            "primary_statistic": "total_hits",
+            "h0": (
+                "independent uniform 6-of-90 draws"
+            ),
+        },
+        "strategy_definitions": strategy_definition(),
+        "surviving_strategies": survivors,
+    }
+
+    DISCOVERY_REPORT.write_text(
+        json.dumps(
+            discovery_output,
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    if not survivors:
+        print(
+            "\nVERDETTO: "
+            "NON SI RIGETTA H0 — NESSUNA EVIDENZA"
+        )
+        print(
+            "Confirmation 2022-2026 NON eseguita."
+        )
+        print(
+            f"Report: {DISCOVERY_REPORT}"
+        )
+        return
+
+    # ================================================================
+    # FREEZE
+    # ================================================================
+    frozen_parameters = {
+        "version": VERSION,
+        "frozen_after_discovery": True,
+        "strategy_definitions": strategy_definition(),
+        "mixed_top_k": MIXED_TOP_K,
+        "mixed_frequency_weight": 0.5,
+        "mixed_delay_weight": 0.5,
+        "sampling": (
+            "sequential weighted sampling without replacement"
+        ),
+        "eps": EPS,
+        "no_parameter_optimization": True,
+        "eligible_strategies": survivors,
+    }
+
+    print("\n" + "=" * 72)
+    print("FREEZE")
+    print("=" * 72)
+    print(
+        "Strategie ammesse alla Confirmation:",
+        ", ".join(survivors),
+    )
+    print(
+        "Regole e parametri congelati."
+    )
+
+    # ================================================================
+    # CONFIRMATION
+    # ================================================================
+    confirmation = analyze_period(
+        df=df,
+        start=CONFIRMATION_START,
+        end=CONFIRMATION_END,
+        label="CONFIRMATION",
+        n_runs=N_RUNS,
+        seed_offset=1_000_000,
+    )
+
+    replicated = []
+
+    print("\n" + "=" * 72)
+    print(
+        "CONFIRMATION OOS 2022-"
+        f"{CONFIRMATION_END.year}"
+    )
+    print("=" * 72)
+
+    for strategy in PICKERS:
+        result = confirmation[
+            "strategies"
+        ][strategy]
+
+        if strategy not in survivors:
+            result[
+                "eligible_for_confirmation"
+            ] = False
+            result[
+                "replicated"
+            ] = False
+            continue
+
+        result[
+            "eligible_for_confirmation"
+        ] = True
+
+        # Confirmation is NOT another 3-strategy search:
+        # only the Discovery survivor is tested here.
+        # Therefore no new Bonferroni multiplication is applied.
+        confirmation_p = result[
+            "monte_carlo"
+        ]["p_upper_mc"]
+
+        result[
+            "confirmation_p_value"
+        ] = float(
+            confirmation_p
+        )
+
+        result[
+            "replicated"
+        ] = bool(
+            confirmation_p < ALPHA
+        )
+
+        if result["replicated"]:
+            replicated.append(
+                strategy
+            )
+
+        print(
+            f"{strategy}: "
+            f"hits={result['observed']['total_hits']} | "
+            f"null_mean={result['monte_carlo']['null_total_hits_mean']:.2f} | "
+            f"p={confirmation_p:.5f} | "
+            f"replicated={result['replicated']}"
+        )
+
+    if replicated:
+        verdict = (
+            "ANOMALIA STATISTICA DA APPROFONDIRE"
+        )
+    else:
+        verdict = (
+            "SEGNALE NON REPLICATO — "
+            "NESSUNA EVIDENZA DI VANTAGGIO ROBUSTO"
+        )
+
+    confirmation_output = {
+        **confirmation,
+        "protocol": {
+            "alpha": ALPHA,
+            "confirmation_is_frozen": True,
+            "no_parameter_optimization": True,
+            "primary_statistic": "total_hits",
+            "h0": (
+                "independent uniform 6-of-90 draws"
+            ),
+        },
+        "strategy_definitions": frozen_parameters,
+        "discovery_survivors": survivors,
+        "surviving_confirmation": replicated,
+        "verdict": verdict,
+    }
+
+    CONFIRMATION_REPORT.write_text(
+        json.dumps(
+            confirmation_output,
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    print(
+        "\nVERDETTO:",
+        verdict,
+    )
+    print(
+        f"Report Discovery: {DISCOVERY_REPORT}"
+    )
+    print(
+        f"Report Confirmation: {CONFIRMATION_REPORT}"
+    )
+
+
+if __name__ == "__main__":
+    main()
 
